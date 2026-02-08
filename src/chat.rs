@@ -1,0 +1,184 @@
+//! Chat mode functionality for multi-turn conversations
+//!
+//! This module provides the interactive chat loop where users can have
+//! back-and-forth conversations. The core session logic is handled by
+//! the unified Session struct in session.rs - this module only handles
+//! the interactive UI loop and user input reading.
+
+use anyhow::{Context, Result};
+use openrouter_rs::OpenRouterClient;
+use std::io::{self, BufRead, Write};
+
+use crate::config::InlineColors;
+use crate::input::parse_file_patterns;
+use crate::models::ModelEntry;
+use crate::readline::ChatReadline;
+use crate::session::{Session, build_user_message};
+
+/// Configuration for starting a chat session.
+#[derive(Debug, Clone)]
+pub struct ChatSessionOptions {
+    /// Initial user prompt (can be empty if STDIN is provided)
+    pub initial_prompt: String,
+    /// Optional STDIN content to include in first message
+    pub initial_stdin: Option<String>,
+    /// Whether to auto-approve file changes
+    pub auto_approve: bool,
+    /// Theme for markdown rendering
+    pub theme_name: String,
+    /// Colors for inline markdown
+    pub inline_colors: InlineColors,
+    /// Optional path to history file for persistence
+    pub history_file: Option<String>,
+}
+
+/// Run an interactive chat session
+///
+/// # Arguments
+///
+/// * `client` - OpenRouter API client
+/// * `model_entry` - Model configuration
+/// * `options` - Chat session configuration
+///
+/// The session runs in a loop:
+/// 1. Send current message to API and display response
+/// 2. Prompt user for next input
+/// 3. Parse file references and output files
+/// 4. Repeat until user exits
+pub async fn run_chat_session(
+    client: OpenRouterClient,
+    model_entry: ModelEntry,
+    options: ChatSessionOptions,
+) -> Result<()> {
+    // Parse all file patterns from initial prompt in a single pass
+    let (final_initial_prompt, initial_file_refs, output_files) =
+        parse_file_patterns(&options.initial_prompt)
+            .context("Failed to parse file patterns from initial prompt")?;
+
+    // Build first message combining file references, prompt, and STDIN
+    let first_message = build_user_message(
+        &initial_file_refs,
+        &final_initial_prompt,
+        options.initial_stdin.as_deref(),
+    );
+
+    // Create unified session
+    let mut session = Session::new(
+        client,
+        model_entry,
+        output_files.clone(),
+        options.auto_approve,
+        options.theme_name.clone(),
+        options.inline_colors.clone(),
+    );
+
+    // Create readline with optional history
+    let mut readline = ChatReadline::new(options.history_file.as_deref())
+        .context("Failed to initialize readline")?;
+
+    println!("=== Chat Mode ===");
+    println!("Type your messages below.");
+    println!("For multiline input: Alt-Enter, Ctrl-O, or Ctrl-J to add a newline.");
+    println!("Type 'exit', 'quit', or press Ctrl+D to end the conversation.\n");
+
+    // Send first message only if there's content
+    let has_initial_content = !first_message.trim().is_empty();
+    if has_initial_content {
+        match session.send_message(first_message).await {
+            Ok(_) => {
+                // Response already displayed during streaming
+            }
+            Err(e) => {
+                eprintln!("\nError: {}", e);
+                eprintln!("Would you like to retry? (y/n): ");
+                io::stdout().flush()?;
+
+                let retry = read_retry_response()?;
+
+                if !retry.trim().eq_ignore_ascii_case("y") {
+                    return Ok(()); // Exit chat
+                }
+                // Retry happens naturally on next loop iteration
+            }
+        }
+    }
+
+    // Main chat loop
+    loop {
+        // Prompt for next user input using readline
+        match readline.read_input(options.inline_colors.get_prompt_color()) {
+            Ok(Some(input)) => {
+                if input.is_empty() {
+                    println!("(Empty input ignored)");
+                    continue;
+                }
+
+                // Parse all file patterns from user input in a single pass
+                let (final_input_prompt, file_refs, new_output_files) =
+                    match parse_file_patterns(&input) {
+                        Ok(result) => result,
+                        Err(e) => {
+                            eprintln!("\nError parsing file patterns: {}", e);
+                            continue;
+                        }
+                    };
+
+                // Add new output files to session
+                if !new_output_files.is_empty() {
+                    session.add_output_files(new_output_files);
+                }
+
+                // Build message with file references (use expanded prompt)
+                let message = build_user_message(&file_refs, &final_input_prompt, None);
+
+                // Send message and get response
+                match session.send_message(message).await {
+                    Ok(_) => {
+                        // Response already displayed during streaming
+                    }
+                    Err(e) => {
+                        eprintln!("\nError: {}", e);
+                        eprintln!("Would you like to retry? (y/n): ");
+                        io::stdout().flush()?;
+
+                        let retry = read_retry_response()?;
+
+                        if retry.trim().eq_ignore_ascii_case("y") {
+                            continue; // Retry the same request
+                        } else {
+                            break; // Exit chat
+                        }
+                    }
+                }
+            }
+            Ok(None) => {
+                // User wants to exit
+                println!("\nGoodbye!");
+                break;
+            }
+            Err(e) => {
+                eprintln!("\nError reading input: {}", e);
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn read_retry_response() -> Result<String> {
+    let mut response = String::new();
+
+    #[cfg(unix)]
+    {
+        use std::fs::File;
+        if let Ok(tty) = File::open("/dev/tty") {
+            let mut reader = io::BufReader::new(tty);
+            reader.read_line(&mut response)?;
+            return Ok(response);
+        }
+    }
+
+    io::stdin().read_line(&mut response)?;
+    Ok(response)
+}
