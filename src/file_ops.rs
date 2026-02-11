@@ -36,7 +36,6 @@ impl FileWriter {
     pub fn write_file(&self, path: &str, content: &str) -> Result<bool> {
         // Security: Validate path is allowed
         if !self.is_allowed(path)? {
-            eprintln!("aborting because path is not allowed!!!");
             bail!(
                 "Security: File '{}' is not in allowed list. \
                  Use !{} in your prompt to allow writing.",
