@@ -14,6 +14,8 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use openrouter_rs::OpenRouterClient;
 use openrouter_rs::api::chat::{ChatCompletionRequest, Message};
+use openrouter_rs::types::completion::FinishReason;
+use openrouter_rs::types::stream::StreamEvent;
 use openrouter_rs::types::{Role, ToolCall};
 use std::io::{self, IsTerminal};
 
@@ -21,7 +23,7 @@ use crate::config::InlineColors;
 use crate::file_ops::FileWriter;
 use crate::input::{FileReference, OutputFileSpec};
 use crate::models::ModelEntry;
-use crate::render::{MarkdownRenderer, StreamRenderer};
+use crate::render::StreamRenderer;
 use crate::system_prompt;
 use crate::tools::SaveFileParams;
 
@@ -88,13 +90,19 @@ impl Session {
         }
     }
 
+    /// Maximum number of tool call round-trips before stopping.
+    /// Prevents infinite loops if the model keeps requesting tools.
+    const MAX_TOOL_ROUNDS: usize = 32;
+    /// Some models reject tool-call assistant messages with empty content.
+    const EMPTY_TOOL_CALL_PLACEHOLDER: &'static str = "[tool call]";
+
     /// Send a user message and get the assistant's response
     ///
     /// This is the core method that handles:
     /// 1. Adding system prompt (on first message only)
     /// 2. Adding user message to history
-    /// 3. Sending request to API (streaming or batch)
-    /// 4. Handling tool calls if present
+    /// 3. Streaming the response (with real-time rendering)
+    /// 4. Handling tool calls if present (with multi-round support)
     /// 5. Adding assistant response to history
     /// 6. Returning the response text
     ///
@@ -119,26 +127,49 @@ impl Session {
         self.messages
             .push(Message::new(Role::User, user_content.as_str()));
 
-        // Build and send request
-        let request = self.build_request()?;
+        let mut all_response_text = String::new();
 
-        // Decide between streaming and batch mode based on tool usage
-        let response_text = if self.output_files.is_empty() {
-            // No tools - use streaming for better UX
-            self.stream_and_collect(&request).await?
-        } else {
-            // Tools expected - use batch mode and handle tool calls
-            self.send_with_tools(&request).await?
-        };
+        // Unified streaming loop: handles both plain responses and tool calls
+        for round in 0..Self::MAX_TOOL_ROUNDS {
+            let request = self.build_request()?;
+            let (response_text, tool_calls) = self.stream_response(&request).await?;
 
-        // Add assistant response to history
-        // Note: send_with_tools adds the response internally due to tool call complexity
-        if self.output_files.is_empty() {
-            self.messages
-                .push(Message::new(Role::Assistant, response_text.as_str()));
+            if !response_text.is_empty() {
+                if !all_response_text.is_empty() {
+                    all_response_text.push('\n');
+                }
+                all_response_text.push_str(&response_text);
+            }
+
+            if tool_calls.is_empty() {
+                // No tool calls -- add assistant response and we're done
+                self.messages
+                    .push(Message::new(Role::Assistant, response_text.as_str()));
+                break;
+            }
+
+            // Tool calls received -- execute them and loop for the follow-up
+            let assistant_content = if response_text.trim().is_empty() {
+                Self::EMPTY_TOOL_CALL_PLACEHOLDER
+            } else {
+                response_text.as_str()
+            };
+            self.messages.push(Message::assistant_with_tool_calls(
+                assistant_content,
+                tool_calls.clone(),
+            ));
+
+            self.execute_tool_calls(&tool_calls).await?;
+
+            if round + 1 >= Self::MAX_TOOL_ROUNDS {
+                eprintln!(
+                    "Warning: reached maximum tool call rounds ({}), stopping",
+                    Self::MAX_TOOL_ROUNDS
+                );
+            }
         }
 
-        Ok(response_text)
+        Ok(all_response_text)
     }
 
     /// Add new output files to the allowed list
@@ -196,11 +227,20 @@ impl Session {
         Ok(request)
     }
 
-    /// Stream response and collect the text
+    /// Stream response, render progressively, and return text + any tool calls
     ///
-    /// Used when no tools are expected. Provides real-time rendering with
-    /// progressive markdown display.
-    async fn stream_and_collect(&self, request: &ChatCompletionRequest) -> Result<String> {
+    /// Uses ToolAwareStream to handle both plain responses and responses with
+    /// tool calls in a single code path. Content is rendered in real-time while
+    /// tool call fragments are accumulated internally by the stream wrapper.
+    ///
+    /// # Returns
+    ///
+    /// A tuple of (accumulated_text, tool_calls). If the model did not invoke
+    /// any tools, `tool_calls` will be empty.
+    async fn stream_response(
+        &self,
+        request: &ChatCompletionRequest,
+    ) -> Result<(String, Vec<ToolCall>)> {
         // Detect if stdout is a terminal or piped
         let is_terminal = io::stdout().is_terminal();
 
@@ -212,25 +252,38 @@ impl Session {
         };
 
         let mut accumulated_text = String::new();
+        let mut result_tool_calls: Vec<ToolCall> = Vec::new();
 
         let mut stream = self
             .client
-            .stream_chat_completion(request)
+            .stream_chat_completion_tool_aware(request)
             .await
             .context("Failed to start streaming chat completion")?;
 
         while let Some(event) = stream.next().await {
             match event {
-                Ok(chunk) => {
-                    if let Some(content) = chunk.choices.first().and_then(|c| c.content()) {
-                        accumulated_text.push_str(content);
-                        renderer
-                            .add_chunk(content)
-                            .context("Failed to render chunk")?;
+                StreamEvent::ContentDelta(text) => {
+                    accumulated_text.push_str(&text);
+                    renderer
+                        .add_chunk(&text)
+                        .context("Failed to render chunk")?;
+                }
+                StreamEvent::Done {
+                    tool_calls,
+                    finish_reason,
+                    ..
+                } => {
+                    if matches!(finish_reason, Some(FinishReason::ToolCalls))
+                        || !tool_calls.is_empty()
+                    {
+                        result_tool_calls = tool_calls;
                     }
                 }
-                Err(e) => {
+                StreamEvent::Error(e) => {
                     eprintln!("Stream error: {}", e);
+                }
+                _ => {
+                    // ReasoningDelta, ReasoningDetailsDelta -- ignore for now
                 }
             }
         }
@@ -240,74 +293,7 @@ impl Session {
             .context("Failed to flush remaining content")?;
         println!(); // Newline after response
 
-        Ok(accumulated_text)
-    }
-
-    /// Send request with tool support and handle tool calls
-    ///
-    /// Used when output files are specified. Sends request in batch mode,
-    /// executes any tool calls, and sends follow-up request with results.
-    async fn send_with_tools(&mut self, request: &ChatCompletionRequest) -> Result<String> {
-        eprintln!("Notice: Response streaming is not yet supported when using output files");
-        // Send initial request
-        let response = self
-            .client
-            .send_chat_completion(request)
-            .await
-            .context("Failed to send chat completion request")?;
-
-        let mut response_text = String::new();
-
-        // Display initial response content
-        if let Some(choice) = response.choices.first() {
-            if let Some(content) = choice.content() {
-                response_text = content.to_string();
-                let renderer =
-                    MarkdownRenderer::with_theme(&self.theme_name, self.inline_colors.clone());
-                renderer.render(content)?;
-                println!();
-            }
-
-            // Check for tool calls
-            if let Some(tool_calls) = choice.tool_calls() {
-                // Add assistant's response with tool calls to history
-                self.messages.push(Message::assistant_with_tool_calls(
-                    choice.content().unwrap_or(""),
-                    tool_calls.to_vec(),
-                ));
-
-                // Execute tool calls
-                self.execute_tool_calls(tool_calls).await?;
-
-                // Send follow-up request with tool results
-                let follow_up_request = self.build_request()?;
-                let final_response = self.client.send_chat_completion(&follow_up_request).await?;
-
-                // Display and save final response
-                if let Some(final_choice) = final_response.choices.first() {
-                    if let Some(final_content) = final_choice.content() {
-                        let renderer = MarkdownRenderer::with_theme(
-                            &self.theme_name,
-                            self.inline_colors.clone(),
-                        );
-                        renderer.render(final_content)?;
-                        println!();
-
-                        // Add final assistant response to history
-                        self.messages
-                            .push(Message::new(Role::Assistant, final_content));
-                        response_text.push_str("\n");
-                        response_text.push_str(final_content);
-                    }
-                }
-            } else {
-                // No tool calls, just add regular assistant message
-                self.messages
-                    .push(Message::new(Role::Assistant, response_text.as_str()));
-            }
-        }
-
-        Ok(response_text)
+        Ok((accumulated_text, result_tool_calls))
     }
 
     /// Execute tool calls and add results to message history
