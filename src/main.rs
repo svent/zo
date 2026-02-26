@@ -27,6 +27,7 @@ use models::ModelEntry;
 #[derive(Parser)]
 #[command(
     name = "zo",
+    version = env!("CARGO_PKG_VERSION"),
     about = "Zettabyte Oracle - A CLI tool for interacting with language models via OpenRouter",
     override_usage = r#"zo [OPTIONS] [PROMPT]
        zo --chat
