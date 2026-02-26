@@ -1,4 +1,4 @@
-# ZO
+# zo - Zettabyte Oracle
 
 A fast, minimal CLI for interacting with LLMs via OpenRouter.
 
