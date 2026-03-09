@@ -14,6 +14,7 @@ use crate::input::parse_file_patterns;
 use crate::models::ModelEntry;
 use crate::readline::ChatReadline;
 use crate::session::{Session, build_user_message};
+use crate::tools::ToolMode;
 
 /// Configuration for starting a chat session.
 #[derive(Debug, Clone)]
@@ -30,6 +31,12 @@ pub struct ChatSessionOptions {
     pub inline_colors: InlineColors,
     /// Optional path to history file for persistence
     pub history_file: Option<String>,
+    /// Tool mode for this chat session
+    pub tool_mode: ToolMode,
+    /// Whether to log model-requested tool calls during execution
+    pub show_tool_calls: bool,
+    /// Whether to show full tool arguments in logs (debug mode)
+    pub show_full_tool_args: bool,
 }
 
 /// Run an interactive chat session
@@ -70,6 +77,9 @@ pub async fn run_chat_session(
         options.auto_approve,
         options.theme_name.clone(),
         options.inline_colors.clone(),
+        options.tool_mode,
+        options.show_tool_calls,
+        options.show_full_tool_args,
     );
 
     // Create readline with optional history

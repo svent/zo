@@ -22,6 +22,7 @@ mod tools;
 use config::Config;
 use input::ParsedInput;
 use models::ModelEntry;
+use tools::{ToolMode, ToolsCliMode};
 
 /// zo - OpenRouter CLI Assistant
 #[derive(Parser)]
@@ -40,6 +41,8 @@ Actions:
 Examples:
     zo +list-models
     zo /sonnet "Explain lifetimes"
+    zo --tools ro "inspect this project"
+    zo --tools rw "refactor the repo"
     zo --chat
     zo --chat "Let's talk"
     "#
@@ -57,6 +60,10 @@ struct Cli {
     #[arg(short, long)]
     debug: bool,
 
+    /// Show tool calls requested by the model as they are executed
+    #[arg(short, long)]
+    verbose: bool,
+
     /// Enable chat mode - have a multi-turn conversation
     #[arg(short, long)]
     chat: bool,
@@ -64,6 +71,10 @@ struct Cli {
     /// Automatically approve all file changes without confirmation
     #[arg(long, short = 'y')]
     yes: bool,
+
+    /// Enable comprehensive tool access
+    #[arg(short = 't', long, value_enum)]
+    tools: Option<ToolsCliMode>,
 }
 
 /// Resolve which model to use based on inputs and config
@@ -124,14 +135,20 @@ fn resolve_model(model_override: Option<String>, config: &Config) -> Result<(Str
 /// - User prompt that will be sent
 /// - File references (if any)
 /// - STDIN content (if any)
-fn display_debug_info(model_name: &str, model_entry: &ModelEntry, parsed_input: &ParsedInput) {
+fn display_debug_info(
+    model_name: &str,
+    model_entry: &ModelEntry,
+    parsed_input: &ParsedInput,
+    tool_mode: ToolMode,
+) {
     println!("=== DEBUG MODE ===\n");
 
     println!("Model Selected:");
     println!("  Short name: {}", model_name);
     println!("  Full ID:    {}", model_entry.model_id);
 
-    let system_prompt = system_prompt::build_system_prompt(model_entry, &parsed_input.output_files);
+    let system_prompt =
+        system_prompt::build_system_prompt(model_entry, &parsed_input.output_files, tool_mode);
 
     if !system_prompt.is_empty() {
         println!("\nSystem Prompt:");
@@ -183,6 +200,13 @@ fn display_debug_info(model_name: &str, model_entry: &ModelEntry, parsed_input: 
         }
     } else {
         println!("\nOutput Files: (none)");
+    }
+
+    println!("\nTool Mode:");
+    match tool_mode {
+        ToolMode::Disabled => println!("  disabled"),
+        ToolMode::ReadOnly => println!("  ro (constrained read tools + scoped writes)"),
+        ToolMode::ReadWrite => println!("  rw (full workspace tools)"),
     }
 
     println!("\n==================\n");
@@ -273,6 +297,11 @@ async fn main() -> Result<()> {
     // Load configuration
     let config = config::load_config().context("Failed to load configuration")?;
 
+    // Resolve tool mode from CLI
+    let tool_mode = ToolMode::from(cli.tools);
+    let show_tool_calls = cli.debug || cli.verbose;
+    let show_full_tool_args = cli.debug;
+
     // Parse input (args + STDIN)
     let parsed_input = input::parse_input(cli.args.clone()).context("Failed to parse input")?;
 
@@ -285,7 +314,7 @@ async fn main() -> Result<()> {
 
     // If debug mode is enabled, show diagnostic info and ask for confirmation
     if cli.debug {
-        display_debug_info(&model_name, &model_entry, &parsed_input);
+        display_debug_info(&model_name, &model_entry, &parsed_input, tool_mode);
 
         if !ask_for_confirmation()? {
             println!("Cancelled.");
@@ -318,6 +347,9 @@ async fn main() -> Result<()> {
                 theme_name: theme_name.to_string(),
                 inline_colors,
                 history_file: config.history_file,
+                tool_mode,
+                show_tool_calls,
+                show_full_tool_args,
             },
         )
         .await
@@ -351,6 +383,9 @@ async fn main() -> Result<()> {
             cli.yes,
             theme_name.to_string(),
             inline_colors,
+            tool_mode,
+            show_tool_calls,
+            show_full_tool_args,
         );
 
         // Send message and get response
@@ -361,4 +396,48 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tools_flag_explicit_ro() {
+        let cli = Cli::try_parse_from(["zo", "--tools", "ro", "hello"]).unwrap();
+        assert_eq!(cli.tools, Some(ToolsCliMode::Ro));
+        assert_eq!(cli.args, vec!["hello"]);
+    }
+
+    #[test]
+    fn test_tools_flag_explicit_rw() {
+        let cli = Cli::try_parse_from(["zo", "--tools", "rw", "hello"]).unwrap();
+        assert_eq!(cli.tools, Some(ToolsCliMode::Rw));
+        assert_eq!(cli.args, vec!["hello"]);
+    }
+
+    #[test]
+    fn test_tools_flag_absent() {
+        let cli = Cli::try_parse_from(["zo", "hello"]).unwrap();
+        assert_eq!(cli.tools, None);
+    }
+
+    #[test]
+    fn test_tools_flag_invalid_mode() {
+        let result = Cli::try_parse_from(["zo", "--tools invalid", "hello"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verbose_flag_present() {
+        let cli = Cli::try_parse_from(["zo", "--verbose", "hello"]).unwrap();
+        assert!(cli.verbose);
+    }
+
+    #[test]
+    fn test_debug_implies_tool_call_logging() {
+        let cli = Cli::try_parse_from(["zo", "--debug", "hello"]).unwrap();
+        let show_tool_calls = cli.debug || cli.verbose;
+        assert!(show_tool_calls);
+    }
 }
