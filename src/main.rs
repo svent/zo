@@ -40,7 +40,7 @@ Actions:
 
 Examples:
     zo +list-models
-    zo /sonnet "Explain lifetimes"
+    zo /codex "Explain lifetimes"
     zo --tools ro "inspect this project"
     zo --tools rw "refactor the repo"
     zo --chat
@@ -52,7 +52,7 @@ struct Cli {
     #[arg(value_name = "PROMPT", trailing_var_arg = true)]
     args: Vec<String>,
 
-    /// Override model selection (e.g., "gpt4", "sonnet")
+    /// Override model selection (e.g., "codex", "sonnet")
     #[arg(short, long)]
     model: Option<String>,
 
@@ -83,7 +83,7 @@ struct Cli {
 /// 1. CLI --model flag
 /// 2. Slash command in prompt
 /// 3. Default model from config
-/// 4. Hardcoded fallback (sonnet)
+/// 4. Hardcoded fallback (codex)
 ///
 /// Returns (model_name, model_entry) tuple so we can display the short name in debug mode
 fn resolve_model(model_override: Option<String>, config: &Config) -> Result<(String, ModelEntry)> {
@@ -98,8 +98,8 @@ fn resolve_model(model_override: Option<String>, config: &Config) -> Result<(Str
         // Use default model from config
         default_model.clone()
     } else {
-        // Hardcoded fallback to sonnet (anthropic/claude-sonnet-4.5)
-        "sonnet".to_string()
+        // Hardcoded fallback to codex (openai/gpt-5.3-codex)
+        "codex".to_string()
     };
 
     // Use fuzzy matching to find the model

@@ -198,7 +198,7 @@ fn validate_config(config: &Config) -> Result<()> {
 ///
 /// Returns a config with:
 /// - No API key (must be provided via env var or config file)
-/// - Default model: "sonnet" (Claude  Sonnet)
+/// - Default model: "codex" (OpenAI Codex 5.3)
 /// - No custom model mappings (uses built-in defaults)
 /// - Empty custom models list
 /// - Default theme: "base16-ocean.dark" (good for dark terminals)
@@ -206,7 +206,7 @@ fn validate_config(config: &Config) -> Result<()> {
 pub fn get_default_config() -> Config {
     Config {
         api_key: None,
-        default_model: Some("sonnet".to_string()),
+        default_model: Some("codex".to_string()),
         models: None,
         custom_models: Vec::new(),
         theme: Some("base16-ocean.dark".to_string()),
@@ -223,7 +223,7 @@ mod tests {
     fn test_validate_config_valid() {
         let config = Config {
             api_key: Some("test-key".to_string()),
-            default_model: Some("sonnet".to_string()),
+            default_model: Some("codex".to_string()),
             models: None,
             custom_models: vec![
                 CustomModel {
@@ -384,7 +384,7 @@ pub fn save_config(config: &Config) -> Result<()> {
 ///
 /// Creates a new config file at the default location with:
 /// - Commented examples for all configuration options
-/// - Default model set to "sonnet"
+/// - Default model set to "codex"
 /// - Example custom model definitions
 /// - Instructions for getting an API key
 ///
@@ -421,8 +421,8 @@ pub fn init_config() -> Result<()> {
 
 # Default model to use when none is specified
 # This will be used if you don't provide a /model command or --model flag
-# Use short names like "sonnet", "flash", "gpt4o", etc.
-default_model = "sonnet"
+# Use short names like "codex", "sonnet", "flash", "gpt4o", etc.
+default_model = "codex"
 
 # Model mappings (shortname -> OpenRouter model ID)
 # If you define this table, it completely overrides the built-in model list
@@ -430,6 +430,7 @@ default_model = "sonnet"
 #
 # Example - uncomment to use your own model list:
 # [models]
+# codex = "openai/gpt-5.3-codex"
 # flash = "google/gemini-2.5-flash"
 # pro = "google/gemini-3-pro-preview"
 # sonnet = "anthropic/claude-sonnet-4.5"

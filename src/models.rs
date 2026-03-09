@@ -12,6 +12,7 @@ pub struct ModelEntry {
 
 /// Default models mapping short names to OpenRouter model IDs
 pub const DEFAULT_MODELS: &[(&str, &str)] = &[
+    ("codex", "openai/gpt-5.3-codex"),
     ("flash", "google/gemini-2.5-flash"),
     ("geminipro", "google/gemini-3-pro-preview"),
     ("gpt4.1", "openai/gpt-4.1"),
@@ -332,11 +333,16 @@ mod tests {
         let model_map = build_model_map(&config);
 
         // Check that default models are present
+        assert!(model_map.contains_key("codex"));
         assert!(model_map.contains_key("sonnet"));
         assert!(model_map.contains_key("flash"));
         assert!(model_map.contains_key("gpt4o"));
 
         // Verify model IDs
+        assert_eq!(
+            model_map.get("codex").unwrap().model_id,
+            "openai/gpt-5.3-codex"
+        );
         assert_eq!(
             model_map.get("sonnet").unwrap().model_id,
             "anthropic/claude-sonnet-4.5"
