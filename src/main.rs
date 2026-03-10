@@ -75,6 +75,10 @@ struct Cli {
     /// Enable comprehensive tool access
     #[arg(short = 't', long, value_enum)]
     tools: Option<ToolsCliMode>,
+
+    /// Allow tool access to hidden files/directories (dotfiles)
+    #[arg(long)]
+    hidden: bool,
 }
 
 /// Resolve which model to use based on inputs and config
@@ -140,6 +144,7 @@ fn display_debug_info(
     model_entry: &ModelEntry,
     parsed_input: &ParsedInput,
     tool_mode: ToolMode,
+    allow_hidden: bool,
 ) {
     println!("=== DEBUG MODE ===\n");
 
@@ -147,8 +152,12 @@ fn display_debug_info(
     println!("  Short name: {}", model_name);
     println!("  Full ID:    {}", model_entry.model_id);
 
-    let system_prompt =
-        system_prompt::build_system_prompt(model_entry, &parsed_input.output_files, tool_mode);
+    let system_prompt = system_prompt::build_system_prompt(
+        model_entry,
+        &parsed_input.output_files,
+        tool_mode,
+        allow_hidden,
+    );
 
     if !system_prompt.is_empty() {
         println!("\nSystem Prompt:");
@@ -208,6 +217,14 @@ fn display_debug_info(
         ToolMode::ReadOnly => println!("  ro (constrained read tools + scoped writes)"),
         ToolMode::ReadWrite => println!("  rw (full workspace tools)"),
     }
+    println!(
+        "  hidden paths: {}",
+        if allow_hidden {
+            "enabled (--hidden)"
+        } else {
+            "blocked by default"
+        }
+    );
 
     println!("\n==================\n");
 }
@@ -314,7 +331,13 @@ async fn main() -> Result<()> {
 
     // If debug mode is enabled, show diagnostic info and ask for confirmation
     if cli.debug {
-        display_debug_info(&model_name, &model_entry, &parsed_input, tool_mode);
+        display_debug_info(
+            &model_name,
+            &model_entry,
+            &parsed_input,
+            tool_mode,
+            cli.hidden,
+        );
 
         if !ask_for_confirmation()? {
             println!("Cancelled.");
@@ -348,6 +371,7 @@ async fn main() -> Result<()> {
                 inline_colors,
                 history_file: config.history_file,
                 tool_mode,
+                allow_hidden: cli.hidden,
                 show_tool_calls,
                 show_full_tool_args,
             },
@@ -384,6 +408,7 @@ async fn main() -> Result<()> {
             theme_name.to_string(),
             inline_colors,
             tool_mode,
+            cli.hidden,
             show_tool_calls,
             show_full_tool_args,
         );
@@ -439,5 +464,17 @@ mod tests {
         let cli = Cli::try_parse_from(["zo", "--debug", "hello"]).unwrap();
         let show_tool_calls = cli.debug || cli.verbose;
         assert!(show_tool_calls);
+    }
+
+    #[test]
+    fn test_hidden_flag_absent_by_default() {
+        let cli = Cli::try_parse_from(["zo", "hello"]).unwrap();
+        assert!(!cli.hidden);
+    }
+
+    #[test]
+    fn test_hidden_flag_present() {
+        let cli = Cli::try_parse_from(["zo", "--hidden", "hello"]).unwrap();
+        assert!(cli.hidden);
     }
 }

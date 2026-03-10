@@ -33,6 +33,8 @@ pub struct ChatSessionOptions {
     pub history_file: Option<String>,
     /// Tool mode for this chat session
     pub tool_mode: ToolMode,
+    /// Whether hidden files/directories are accessible to tools
+    pub allow_hidden: bool,
     /// Whether to log model-requested tool calls during execution
     pub show_tool_calls: bool,
     /// Whether to show full tool arguments in logs (debug mode)
@@ -78,6 +80,7 @@ pub async fn run_chat_session(
         options.theme_name.clone(),
         options.inline_colors.clone(),
         options.tool_mode,
+        options.allow_hidden,
         options.show_tool_calls,
         options.show_full_tool_args,
     );

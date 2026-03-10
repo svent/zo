@@ -303,10 +303,39 @@ fn relative_display_path(path: &Path) -> Result<String> {
     }
 }
 
-fn walk_builder(root: &Path) -> WalkBuilder {
+fn has_hidden_component(path: &Path) -> bool {
+    path.components().any(|component| match component {
+        Component::Normal(name) => name.to_string_lossy().starts_with('.'),
+        _ => false,
+    })
+}
+
+pub fn enforce_tool_path_policy(resolved: &Path, original: &str, allow_hidden: bool) -> Result<()> {
+    let root = workspace_root()?;
+    ensure_within_workspace(resolved, &root, original)?;
+
+    if allow_hidden {
+        return Ok(());
+    }
+
+    let relative = resolved
+        .strip_prefix(&root)
+        .with_context(|| format!("Path not under workspace root: {}", resolved.display()))?;
+
+    if has_hidden_component(relative) {
+        bail!(
+            "Hidden path access is disabled by default. Re-run with --hidden to access: {}",
+            original
+        );
+    }
+
+    Ok(())
+}
+
+fn walk_builder(root: &Path, allow_hidden: bool) -> WalkBuilder {
     let mut builder = WalkBuilder::new(root);
     builder
-        .hidden(true)
+        .hidden(!allow_hidden)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
@@ -327,9 +356,10 @@ pub fn clamp_tool_output(output: String) -> String {
     )
 }
 
-pub fn run_list_files(path: &str) -> Result<String> {
+pub fn run_list_files(path: &str, allow_hidden: bool) -> Result<String> {
     let resolved = resolve_workspace_path(path, false)
         .with_context(|| format!("Invalid path for list_files: {}", path))?;
+    enforce_tool_path_policy(&resolved, path, allow_hidden)?;
 
     if resolved.is_file() {
         let display = relative_display_path(&resolved)?;
@@ -343,7 +373,10 @@ pub fn run_list_files(path: &str) -> Result<String> {
     let mut entries = Vec::new();
     let mut omitted = 0usize;
 
-    for result in walk_builder(&resolved).max_depth(Some(1)).build() {
+    for result in walk_builder(&resolved, allow_hidden)
+        .max_depth(Some(1))
+        .build()
+    {
         let dent = match result {
             Ok(dent) => dent,
             Err(err) => {
@@ -385,7 +418,7 @@ pub fn run_list_files(path: &str) -> Result<String> {
     Ok(clamp_tool_output(output))
 }
 
-pub fn run_find(glob_pattern: &str) -> Result<String> {
+pub fn run_find(glob_pattern: &str, allow_hidden: bool) -> Result<String> {
     let pattern = glob::Pattern::new(glob_pattern)
         .with_context(|| format!("Invalid glob pattern: {}", glob_pattern))?;
 
@@ -393,7 +426,7 @@ pub fn run_find(glob_pattern: &str) -> Result<String> {
     let mut matches = Vec::new();
     let mut omitted = 0usize;
 
-    for result in walk_builder(&root).build() {
+    for result in walk_builder(&root, allow_hidden).build() {
         let dent = match result {
             Ok(dent) => dent,
             Err(err) => {
@@ -435,7 +468,7 @@ pub fn run_find(glob_pattern: &str) -> Result<String> {
     Ok(clamp_tool_output(output))
 }
 
-fn run_grep(pattern: &str, path_glob: &str, exact: bool) -> Result<String> {
+fn run_grep(pattern: &str, path_glob: &str, exact: bool, allow_hidden: bool) -> Result<String> {
     if pattern.is_empty() {
         bail!("Pattern must not be empty");
     }
@@ -459,7 +492,7 @@ fn run_grep(pattern: &str, path_glob: &str, exact: bool) -> Result<String> {
     let mut matches = Vec::new();
     let mut omitted = 0usize;
 
-    'walk: for result in walk_builder(&root).build() {
+    'walk: for result in walk_builder(&root, allow_hidden).build() {
         let dent = match result {
             Ok(dent) => dent,
             Err(err) => {
@@ -523,21 +556,23 @@ fn run_grep(pattern: &str, path_glob: &str, exact: bool) -> Result<String> {
     Ok(clamp_tool_output(output))
 }
 
-pub fn run_grep_regex(pattern: &str, path_glob: &str) -> Result<String> {
-    run_grep(pattern, path_glob, false)
+pub fn run_grep_regex(pattern: &str, path_glob: &str, allow_hidden: bool) -> Result<String> {
+    run_grep(pattern, path_glob, false, allow_hidden)
 }
 
-pub fn run_grep_exact(text: &str, path_glob: &str) -> Result<String> {
-    run_grep(text, path_glob, true)
+pub fn run_grep_exact(text: &str, path_glob: &str, allow_hidden: bool) -> Result<String> {
+    run_grep(text, path_glob, true, allow_hidden)
 }
 
 pub fn run_read_file(
     path: &str,
     start_line: Option<usize>,
     end_line: Option<usize>,
+    allow_hidden: bool,
 ) -> Result<String> {
     let resolved = resolve_workspace_path(path, false)
         .with_context(|| format!("Invalid path for read_file: {}", path))?;
+    enforce_tool_path_policy(&resolved, path, allow_hidden)?;
 
     if !resolved.is_file() {
         bail!("Path is not a readable file: {}", path);
@@ -671,11 +706,41 @@ mod tests {
         writeln!(file, "line2").unwrap();
         writeln!(file, "line3").unwrap();
 
-        let out = run_read_file(test_file, Some(2), Some(3)).unwrap();
+        let out = run_read_file(test_file, Some(2), Some(3), false).unwrap();
         assert!(out.contains("2: line2"));
         assert!(out.contains("3: line3"));
         assert!(!out.contains("1: line1"));
 
         fs::remove_file(test_file).ok();
+    }
+
+    #[test]
+    fn test_enforce_tool_path_policy_blocks_hidden_by_default() {
+        let hidden_file = ".test_hidden_policy_block.txt";
+        fs::write(hidden_file, "secret").unwrap();
+
+        let resolved = resolve_workspace_path(hidden_file, false).unwrap();
+        let blocked = enforce_tool_path_policy(&resolved, hidden_file, false);
+        assert!(blocked.is_err());
+        assert!(blocked.unwrap_err().to_string().contains("--hidden"));
+
+        let allowed = enforce_tool_path_policy(&resolved, hidden_file, true);
+        assert!(allowed.is_ok());
+
+        fs::remove_file(hidden_file).ok();
+    }
+
+    #[test]
+    fn test_run_find_hides_hidden_files_unless_enabled() {
+        let hidden_file = ".test_hidden_find_case.txt";
+        fs::write(hidden_file, "secret").unwrap();
+
+        let blocked = run_find(".test_hidden_find_case.txt", false).unwrap();
+        assert!(blocked.starts_with("0 matches"));
+
+        let allowed = run_find(".test_hidden_find_case.txt", true).unwrap();
+        assert!(allowed.contains(hidden_file));
+
+        fs::remove_file(hidden_file).ok();
     }
 }

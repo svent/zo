@@ -7,12 +7,13 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use crate::config::InlineColors;
-use crate::tools::resolve_workspace_path;
+use crate::tools::{enforce_tool_path_policy, resolve_workspace_path};
 
 /// Handles file writing with security checks and user approval
 pub struct FileWriter {
     allowed_files: Vec<String>,
     allow_all_within_workspace: bool,
+    allow_hidden: bool,
     auto_approve: bool,
     inline_colors: InlineColors,
 }
@@ -28,12 +29,14 @@ impl FileWriter {
     pub fn new(
         allowed_files: Vec<String>,
         allow_all_within_workspace: bool,
+        allow_hidden: bool,
         auto_approve: bool,
         inline_colors: InlineColors,
     ) -> Self {
         Self {
             allowed_files,
             allow_all_within_workspace,
+            allow_hidden,
             auto_approve,
             inline_colors,
         }
@@ -145,6 +148,7 @@ impl FileWriter {
 
     fn authorize_path(&self, path: &str, allow_missing: bool) -> Result<PathBuf> {
         let resolved = resolve_workspace_path(path, allow_missing)?;
+        enforce_tool_path_policy(&resolved, path, self.allow_hidden)?;
         let normalized = resolved.to_string_lossy().to_string();
 
         if self.allow_all_within_workspace || self.allowed_files.iter().any(|p| p == &normalized) {
@@ -293,7 +297,7 @@ mod tests {
             .to_string_lossy()
             .to_string();
         let inline_colors = InlineColors::default();
-        let writer = FileWriter::new(vec![normalized], false, true, inline_colors);
+        let writer = FileWriter::new(vec![normalized], false, false, true, inline_colors);
 
         let result = writer.write_file(temp_file, "test content");
         assert!(result.is_ok());
@@ -309,7 +313,7 @@ mod tests {
     #[test]
     fn test_file_writer_rejects_unallowed() {
         let inline_colors = InlineColors::default();
-        let writer = FileWriter::new(vec![], false, true, inline_colors);
+        let writer = FileWriter::new(vec![], false, false, true, inline_colors);
         let result = writer.write_file("forbidden.txt", "content");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("allowed list"));
@@ -326,7 +330,7 @@ mod tests {
             .to_string_lossy()
             .to_string();
         let inline_colors = InlineColors::default();
-        let writer = FileWriter::new(vec![normalized], false, true, inline_colors);
+        let writer = FileWriter::new(vec![normalized], false, false, true, inline_colors);
 
         let result = writer.write_file(temp_file, "new content");
         assert!(result.is_ok());
@@ -347,7 +351,13 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let writer = FileWriter::new(vec![normalized], false, true, InlineColors::default());
+        let writer = FileWriter::new(
+            vec![normalized],
+            false,
+            false,
+            true,
+            InlineColors::default(),
+        );
 
         let result = writer.edit_file(temp_file, "world", "rust");
         assert!(result.unwrap());
@@ -367,7 +377,13 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let writer = FileWriter::new(vec![normalized], false, true, InlineColors::default());
+        let writer = FileWriter::new(
+            vec![normalized],
+            false,
+            false,
+            true,
+            InlineColors::default(),
+        );
 
         let result = writer.edit_file(temp_file, "x", "y");
         assert!(result.is_err());
@@ -385,7 +401,13 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let writer = FileWriter::new(vec![normalized], false, true, InlineColors::default());
+        let writer = FileWriter::new(
+            vec![normalized],
+            false,
+            false,
+            true,
+            InlineColors::default(),
+        );
 
         let result = writer.replace_lines(temp_file, 2, 3, "x\ny");
         assert!(result.unwrap());
@@ -405,7 +427,13 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let writer = FileWriter::new(vec![normalized], false, true, InlineColors::default());
+        let writer = FileWriter::new(
+            vec![normalized],
+            false,
+            false,
+            true,
+            InlineColors::default(),
+        );
 
         let result = writer.replace_lines(temp_file, 2, 4, "x");
         assert!(result.is_err());
@@ -419,7 +447,7 @@ mod tests {
         let temp_file = "test_allow_all_workspace.txt";
         let _ = fs::remove_file(temp_file);
 
-        let writer = FileWriter::new(vec![], true, true, InlineColors::default());
+        let writer = FileWriter::new(vec![], true, false, true, InlineColors::default());
         let result = writer.write_file(temp_file, "workspace write");
 
         assert!(result.unwrap());
@@ -427,6 +455,23 @@ mod tests {
         assert_eq!(content, "workspace write");
 
         fs::remove_file(temp_file).ok();
+    }
+
+    #[test]
+    fn test_file_writer_blocks_hidden_path_by_default() {
+        let hidden_file = ".test_file_writer_hidden.txt";
+        let _ = fs::remove_file(hidden_file);
+
+        let blocked_writer = FileWriter::new(vec![], true, false, true, InlineColors::default());
+        let blocked = blocked_writer.write_file(hidden_file, "hidden content");
+        assert!(blocked.is_err());
+        assert!(blocked.unwrap_err().to_string().contains("--hidden"));
+
+        let allowed_writer = FileWriter::new(vec![], true, true, true, InlineColors::default());
+        let allowed = allowed_writer.write_file(hidden_file, "hidden content");
+        assert!(allowed.unwrap());
+
+        fs::remove_file(hidden_file).ok();
     }
 
     #[test]
@@ -447,7 +492,13 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let writer = FileWriter::new(vec![normalized], false, true, InlineColors::default());
+        let writer = FileWriter::new(
+            vec![normalized],
+            false,
+            false,
+            true,
+            InlineColors::default(),
+        );
 
         let result = writer.replace_lines(temp_file, 2, 2, "x\ny");
         assert!(result.unwrap());

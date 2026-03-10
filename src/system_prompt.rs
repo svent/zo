@@ -7,6 +7,7 @@ pub fn build_system_prompt(
     model_entry: &ModelEntry,
     output_files: &[OutputFileSpec],
     tool_mode: ToolMode,
+    allow_hidden: bool,
 ) -> String {
     let mut system_prompt = model_entry.system_prompt.clone().unwrap_or_default();
 
@@ -30,12 +31,17 @@ pub fn build_system_prompt(
                     "IMPORTANT: You can write files only via the `write_file` tool. \
                      Allowed output files: {}. \
                      Use `write_file` with the real filename (without !/@! markers). \
-                     Never write to any other path.",
+                     Never write to any other path.{}",
                     output_files
                         .iter()
                         .map(|f| f.filename.as_str())
                         .collect::<Vec<_>>()
-                        .join(", ")
+                        .join(", "),
+                    if allow_hidden {
+                        ""
+                    } else {
+                        " Hidden paths (dotfiles/dot-directories) are blocked unless the user enables --hidden."
+                    }
                 ))
             }
         }
@@ -45,6 +51,12 @@ pub fn build_system_prompt(
                 "Read tools available: list_files(path), find(glob), grep_regex(pattern, path_glob), grep_exact(text, path_glob), read_file(path, start_line, end_line).".to_string(),
                 "Use tools sparingly and with narrow queries; outputs are truncated for safety.".to_string(),
             ];
+            if !allow_hidden {
+                parts.push(
+                    "Hidden paths (dotfiles/dot-directories) are blocked unless the user enables --hidden."
+                        .to_string(),
+                );
+            }
 
             if output_files.is_empty() {
                 parts.push(
@@ -66,24 +78,35 @@ pub fn build_system_prompt(
                     ));
                 }
 
-
-                parts.push("Use write tools with the real filename (without !/@! markers).".to_string());
                 parts.push(
-                    "Never modify files outside those explicit write permissions."
-                        .to_string(),
+                    "Use write tools with the real filename (without !/@! markers).".to_string(),
+                );
+                parts.push(
+                    "Never modify files outside those explicit write permissions.".to_string(),
                 );
             }
 
             Some(parts.join("\n"))
         }
-        ToolMode::ReadWrite => Some(
-            "IMPORTANT: Tool mode is enabled in read-write workspace mode. \
-             You may read and modify files within the current working directory using tools. \
-             Available tools: list_files, find, grep_regex, grep_exact, read_file, write_file, edit_file, replace_lines. \
-             Files referenced via @file/@!file are still provided directly in the user message. \
-             Keep tool calls focused and minimal; outputs are truncated for safety."
-                .to_string(),
-        ),
+        ToolMode::ReadWrite => {
+            let mut parts = vec![
+                "IMPORTANT: Tool mode is enabled in read-write workspace mode.".to_string(),
+                "You may read and modify files within the current working directory using tools."
+                    .to_string(),
+                "Available tools: list_files, find, grep_regex, grep_exact, read_file, write_file, edit_file, replace_lines."
+                    .to_string(),
+                "Files referenced via @file/@!file are still provided directly in the user message."
+                    .to_string(),
+                "Keep tool calls focused and minimal; outputs are truncated for safety.".to_string(),
+            ];
+            if !allow_hidden {
+                parts.push(
+                    "Hidden paths (dotfiles/dot-directories) are blocked unless the user enables --hidden."
+                        .to_string(),
+                );
+            }
+            Some(parts.join("\n"))
+        }
     };
 
     if let Some(instructions) = tool_instructions {
@@ -119,14 +142,19 @@ mod tests {
 
     #[test]
     fn test_disabled_mode_with_outputs_mentions_write_file() {
-        let prompt = build_system_prompt(&model(), &[output("a.txt", false)], ToolMode::Disabled);
+        let prompt = build_system_prompt(
+            &model(),
+            &[output("a.txt", false)],
+            ToolMode::Disabled,
+            false,
+        );
         assert!(prompt.contains("write_file"));
         assert!(prompt.contains("a.txt"));
     }
 
     #[test]
     fn test_read_only_mode_mentions_read_tools() {
-        let prompt = build_system_prompt(&model(), &[], ToolMode::ReadOnly);
+        let prompt = build_system_prompt(&model(), &[], ToolMode::ReadOnly, false);
         assert!(prompt.contains("list_files"));
         assert!(prompt.contains("No write permissions"));
     }
@@ -137,6 +165,7 @@ mod tests {
             &model(),
             &[output("wo.txt", false), output("rw.txt", true)],
             ToolMode::ReadOnly,
+            false,
         );
         assert!(prompt.contains("Write-only files"));
         assert!(prompt.contains("wo.txt"));
@@ -146,7 +175,19 @@ mod tests {
 
     #[test]
     fn test_read_write_mode_mentions_full_tools() {
-        let prompt = build_system_prompt(&model(), &[], ToolMode::ReadWrite);
+        let prompt = build_system_prompt(&model(), &[], ToolMode::ReadWrite, false);
         assert!(prompt.contains("replace_lines"));
+    }
+
+    #[test]
+    fn test_hidden_restriction_appears_when_disabled() {
+        let prompt = build_system_prompt(&model(), &[], ToolMode::ReadOnly, false);
+        assert!(prompt.contains("--hidden"));
+    }
+
+    #[test]
+    fn test_hidden_restriction_omitted_when_enabled() {
+        let prompt = build_system_prompt(&model(), &[], ToolMode::ReadOnly, true);
+        assert!(!prompt.contains("--hidden"));
     }
 }

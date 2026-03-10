@@ -48,6 +48,8 @@ pub struct Session {
     inline_colors: InlineColors,
     /// Tool access mode
     tool_mode: ToolMode,
+    /// Whether hidden files/directories are accessible to tools
+    allow_hidden: bool,
     /// Whether to print tool calls requested by the model before executing them
     show_tool_calls: bool,
     /// Whether to show full tool arguments in logs (for debug mode)
@@ -103,6 +105,7 @@ impl Session {
         theme_name: String,
         inline_colors: InlineColors,
         tool_mode: ToolMode,
+        allow_hidden: bool,
         show_tool_calls: bool,
         show_full_tool_args: bool,
     ) -> Self {
@@ -115,6 +118,7 @@ impl Session {
             theme_name,
             inline_colors,
             tool_mode,
+            allow_hidden,
             show_tool_calls,
             show_full_tool_args,
         }
@@ -209,7 +213,12 @@ impl Session {
 
     /// Build the system prompt including tool and file access instructions.
     fn build_system_prompt(&self) -> String {
-        system_prompt::build_system_prompt(&self.model_entry, &self.output_files, self.tool_mode)
+        system_prompt::build_system_prompt(
+            &self.model_entry,
+            &self.output_files,
+            self.tool_mode,
+            self.allow_hidden,
+        )
     }
 
     fn tool_availability(&self) -> ToolAvailability {
@@ -357,6 +366,7 @@ impl Session {
         let write_writer = FileWriter::new(
             self.output_write_paths(),
             matches!(self.tool_mode, ToolMode::ReadWrite),
+            self.allow_hidden,
             self.auto_approve,
             self.inline_colors.clone(),
         );
@@ -364,6 +374,7 @@ impl Session {
         let edit_writer = FileWriter::new(
             self.output_edit_paths(),
             matches!(self.tool_mode, ToolMode::ReadWrite),
+            self.allow_hidden,
             self.auto_approve,
             self.inline_colors.clone(),
         );
@@ -408,12 +419,7 @@ impl Session {
             .unwrap_or_else(|_| truncate_with_suffix(raw_args, Self::TOOL_LOG_ONE_LINE_MAX_CHARS));
 
         if compact_args.chars().count() <= Self::TOOL_LOG_ONE_LINE_MAX_CHARS {
-            eprintln!(
-                "[tool] {} id={} args={}",
-                tool_call.name(),
-                tool_call.id(),
-                compact_args
-            );
+            eprintln!("[tool] {} args={}", tool_call.name(), compact_args);
             return;
         }
 
@@ -431,12 +437,7 @@ impl Session {
         }
 
         let one_line_args = truncate_with_suffix(&compact_args, Self::TOOL_LOG_ONE_LINE_MAX_CHARS);
-        eprintln!(
-            "[tool] {} id={} args={}",
-            tool_call.name(),
-            tool_call.id(),
-            one_line_args
-        );
+        eprintln!("[tool] {} args={}", tool_call.name(), one_line_args);
     }
 
     fn execute_single_tool_call(
@@ -454,7 +455,7 @@ impl Session {
                 let params = tool_call
                     .parse_params::<ListFilesParams>()
                     .context("Invalid list_files parameters")?;
-                run_list_files(&params.path)
+                run_list_files(&params.path, self.allow_hidden)
             }
             "find" => {
                 if !availability.read_tools {
@@ -463,7 +464,7 @@ impl Session {
                 let params = tool_call
                     .parse_params::<FindParams>()
                     .context("Invalid find parameters")?;
-                run_find(&params.glob)
+                run_find(&params.glob, self.allow_hidden)
             }
             "grep_regex" => {
                 if !availability.read_tools {
@@ -472,7 +473,7 @@ impl Session {
                 let params = tool_call
                     .parse_params::<GrepRegexParams>()
                     .context("Invalid grep_regex parameters")?;
-                run_grep_regex(&params.pattern, &params.path_glob)
+                run_grep_regex(&params.pattern, &params.path_glob, self.allow_hidden)
             }
             "grep_exact" => {
                 if !availability.read_tools {
@@ -481,7 +482,7 @@ impl Session {
                 let params = tool_call
                     .parse_params::<GrepExactParams>()
                     .context("Invalid grep_exact parameters")?;
-                run_grep_exact(&params.text, &params.path_glob)
+                run_grep_exact(&params.text, &params.path_glob, self.allow_hidden)
             }
             "read_file" => {
                 if !availability.read_tools {
@@ -490,7 +491,12 @@ impl Session {
                 let params = tool_call
                     .parse_params::<ReadFileParams>()
                     .context("Invalid read_file parameters")?;
-                run_read_file(&params.path, params.start_line, params.end_line)
+                run_read_file(
+                    &params.path,
+                    params.start_line,
+                    params.end_line,
+                    self.allow_hidden,
+                )
             }
             "write_file" => {
                 if !availability.write_file {
