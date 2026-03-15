@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use crossterm::ExecutableCommand;
 use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
-use pulldown_cmark::{Event, Options, Parser, Tag};
+use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag};
 use std::io::{self, Write};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Style, ThemeSet};
@@ -9,6 +9,8 @@ use syntect::parsing::SyntaxSet;
 use syntect::util::{LinesWithEndings, as_24_bit_terminal_escaped};
 
 use crate::config::InlineColors;
+
+const HEADING_RULE_LINE: &str = "────────────────────────────────────────";
 
 /// Parse a color name or hex string into a crossterm Color.
 ///
@@ -37,6 +39,109 @@ fn parse_color(color_name: &str) -> Option<Color> {
         }
         _ => None,
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HeadingFormat {
+    prefix: &'static str,
+    use_heading_color: bool,
+    bold: bool,
+    dim: bool,
+    leading_blank_line: bool,
+    trailing_blank_line: bool,
+    underline: bool,
+}
+
+fn heading_format(level: HeadingLevel) -> HeadingFormat {
+    match level {
+        HeadingLevel::H1 => HeadingFormat {
+            prefix: "",
+            use_heading_color: true,
+            bold: true,
+            dim: false,
+            leading_blank_line: true,
+            trailing_blank_line: true,
+            underline: true,
+        },
+        HeadingLevel::H2 => HeadingFormat {
+            prefix: "",
+            use_heading_color: true,
+            bold: true,
+            dim: false,
+            leading_blank_line: true,
+            trailing_blank_line: true,
+            underline: false,
+        },
+        HeadingLevel::H3 => HeadingFormat {
+            prefix: "",
+            use_heading_color: true,
+            bold: true,
+            dim: false,
+            leading_blank_line: false,
+            trailing_blank_line: false,
+            underline: false,
+        },
+        HeadingLevel::H4 => HeadingFormat {
+            prefix: "▸ ",
+            use_heading_color: true,
+            bold: false,
+            dim: false,
+            leading_blank_line: false,
+            trailing_blank_line: false,
+            underline: false,
+        },
+        HeadingLevel::H5 => HeadingFormat {
+            prefix: "▹ ",
+            use_heading_color: true,
+            bold: false,
+            dim: true,
+            leading_blank_line: false,
+            trailing_blank_line: false,
+            underline: false,
+        },
+        HeadingLevel::H6 => HeadingFormat {
+            prefix: "· ",
+            use_heading_color: false,
+            bold: false,
+            dim: true,
+            leading_blank_line: false,
+            trailing_blank_line: false,
+            underline: false,
+        },
+    }
+}
+
+fn apply_heading_style<W: Write>(
+    out: &mut W,
+    level: HeadingLevel,
+    heading_color: Color,
+    include_prefix: bool,
+) -> Result<()> {
+    let format = heading_format(level);
+    if format.use_heading_color {
+        out.execute(SetForegroundColor(heading_color))?;
+    }
+    if format.bold {
+        out.execute(SetAttribute(Attribute::Bold))?;
+    }
+    if format.dim {
+        out.execute(SetAttribute(Attribute::Dim))?;
+    }
+    if include_prefix && !format.prefix.is_empty() {
+        out.execute(Print(format.prefix))?;
+    }
+    Ok(())
+}
+
+fn reapply_heading_style_if_active<W: Write>(
+    out: &mut W,
+    active_heading_level: Option<HeadingLevel>,
+    heading_color: Color,
+) -> Result<()> {
+    if let Some(level) = active_heading_level {
+        apply_heading_style(out, level, heading_color, false)?;
+    }
+    Ok(())
 }
 
 impl InlineColors {
@@ -146,7 +251,7 @@ impl MarkdownRenderer {
         let mut in_code_block = false;
         let mut code_block_lang = String::new();
         let mut code_block_content = String::new();
-        let mut in_heading = false;
+        let mut active_heading_level: Option<HeadingLevel> = None;
 
         for event in parser {
             match event {
@@ -170,12 +275,6 @@ impl MarkdownRenderer {
                 Event::Text(text) => {
                     if in_code_block {
                         code_block_content.push_str(&text);
-                    } else if in_heading {
-                        // Render headings in configured color
-                        stdout
-                            .execute(SetForegroundColor(self.inline_colors.get_heading_color()))?
-                            .execute(Print(&*text))?
-                            .execute(ResetColor)?;
                     } else {
                         print!("{}", text);
                     }
@@ -190,13 +289,39 @@ impl MarkdownRenderer {
                         .execute(Print(&*code))?
                         .execute(Print("`"))?
                         .execute(ResetColor)?;
+                    reapply_heading_style_if_active(
+                        &mut stdout,
+                        active_heading_level,
+                        self.inline_colors.get_heading_color(),
+                    )?;
                 }
-                Event::Start(Tag::Heading(..)) => {
-                    in_heading = true;
+                Event::Start(Tag::Heading(level, ..)) => {
+                    let format = heading_format(level);
+                    if format.leading_blank_line {
+                        println!();
+                    }
+                    apply_heading_style(
+                        &mut stdout,
+                        level,
+                        self.inline_colors.get_heading_color(),
+                        true,
+                    )?;
+                    active_heading_level = Some(level);
                 }
-                Event::End(Tag::Heading(..)) => {
-                    in_heading = false;
+                Event::End(Tag::Heading(level, ..)) => {
+                    stdout
+                        .execute(SetAttribute(Attribute::Reset))?
+                        .execute(ResetColor)?;
+                    let format = heading_format(level);
+                    if format.underline {
+                        println!();
+                        println!("{}", HEADING_RULE_LINE);
+                    }
                     println!(); // Newline after heading
+                    if format.trailing_blank_line {
+                        println!();
+                    }
+                    active_heading_level = None;
                 }
                 Event::Start(Tag::Paragraph) => {}
                 Event::End(Tag::Paragraph) => {
@@ -217,12 +342,22 @@ impl MarkdownRenderer {
                 }
                 Event::End(Tag::Emphasis) => {
                     stdout.execute(ResetColor)?;
+                    reapply_heading_style_if_active(
+                        &mut stdout,
+                        active_heading_level,
+                        self.inline_colors.get_heading_color(),
+                    )?;
                 }
                 Event::Start(Tag::Strong) => {
                     stdout.execute(SetForegroundColor(self.inline_colors.get_emphasis_color()))?;
                 }
                 Event::End(Tag::Strong) => {
                     stdout.execute(ResetColor)?;
+                    reapply_heading_style_if_active(
+                        &mut stdout,
+                        active_heading_level,
+                        self.inline_colors.get_heading_color(),
+                    )?;
                 }
                 Event::SoftBreak => {
                     print!(" ");
@@ -231,7 +366,7 @@ impl MarkdownRenderer {
                     println!();
                 }
                 Event::Rule => {
-                    println!("────────────────────────────────────────");
+                    println!("{}", HEADING_RULE_LINE);
                 }
                 _ => {}
             }
@@ -504,16 +639,31 @@ impl StreamRenderer {
 
         let mut list_stack: Vec<Option<u64>> = Vec::new();
         let mut link_dest_stack: Vec<String> = Vec::new();
+        let mut active_heading_level: Option<HeadingLevel> = None;
+        let mut extra_trailing_newlines = 0usize;
 
         for event in parser {
             match event {
-                Event::Start(Tag::Heading(..)) => {
-                    out.execute(SetForegroundColor(self.inline_colors.get_heading_color()))?
-                        .execute(SetAttribute(Attribute::Bold))?;
+                Event::Start(Tag::Heading(level, ..)) => {
+                    let format = heading_format(level);
+                    if format.leading_blank_line {
+                        out.execute(Print("\n"))?;
+                    }
+                    apply_heading_style(out, level, self.inline_colors.get_heading_color(), true)?;
+                    active_heading_level = Some(level);
                 }
-                Event::End(Tag::Heading(..)) => {
+                Event::End(Tag::Heading(level, ..)) => {
                     out.execute(SetAttribute(Attribute::Reset))?
                         .execute(ResetColor)?;
+                    let format = heading_format(level);
+                    if format.underline {
+                        out.execute(Print("\n"))?;
+                        out.execute(Print(HEADING_RULE_LINE))?;
+                    }
+                    if format.trailing_blank_line {
+                        extra_trailing_newlines += 1;
+                    }
+                    active_heading_level = None;
                 }
                 Event::Start(Tag::Strong) => {
                     out.execute(SetForegroundColor(self.inline_colors.get_emphasis_color()))?
@@ -522,6 +672,11 @@ impl StreamRenderer {
                 Event::End(Tag::Strong) => {
                     out.execute(SetAttribute(Attribute::Reset))?
                         .execute(ResetColor)?;
+                    reapply_heading_style_if_active(
+                        out,
+                        active_heading_level,
+                        self.inline_colors.get_heading_color(),
+                    )?;
                 }
                 Event::Start(Tag::Emphasis) => {
                     out.execute(SetForegroundColor(self.inline_colors.get_emphasis_color()))?
@@ -530,6 +685,11 @@ impl StreamRenderer {
                 Event::End(Tag::Emphasis) => {
                     out.execute(SetAttribute(Attribute::Reset))?
                         .execute(ResetColor)?;
+                    reapply_heading_style_if_active(
+                        out,
+                        active_heading_level,
+                        self.inline_colors.get_heading_color(),
+                    )?;
                 }
                 Event::Start(Tag::Strikethrough) => {
                     out.execute(SetForegroundColor(self.inline_colors.get_emphasis_color()))?
@@ -538,6 +698,11 @@ impl StreamRenderer {
                 Event::End(Tag::Strikethrough) => {
                     out.execute(SetAttribute(Attribute::Reset))?
                         .execute(ResetColor)?;
+                    reapply_heading_style_if_active(
+                        out,
+                        active_heading_level,
+                        self.inline_colors.get_heading_color(),
+                    )?;
                 }
                 Event::Start(Tag::Link(_, destination, _)) => {
                     link_dest_stack.push(destination.to_string());
@@ -553,6 +718,11 @@ impl StreamRenderer {
                             out.execute(Print(format!(" ({})", destination)))?;
                         }
                     }
+                    reapply_heading_style_if_active(
+                        out,
+                        active_heading_level,
+                        self.inline_colors.get_heading_color(),
+                    )?;
                 }
                 Event::Start(Tag::BlockQuote) => {
                     out.execute(SetForegroundColor(self.inline_colors.get_emphasis_color()))?
@@ -601,6 +771,11 @@ impl StreamRenderer {
                     .execute(Print(&*code))?
                     .execute(Print("`"))?
                     .execute(ResetColor)?;
+                    reapply_heading_style_if_active(
+                        out,
+                        active_heading_level,
+                        self.inline_colors.get_heading_color(),
+                    )?;
                 }
                 Event::SoftBreak => {
                     out.execute(Print(" "))?;
@@ -609,7 +784,7 @@ impl StreamRenderer {
                     out.execute(Print("\n"))?;
                 }
                 Event::Rule => {
-                    out.execute(Print("────────────────────────────────────────"))?;
+                    out.execute(Print(HEADING_RULE_LINE))?;
                 }
                 _ => {}
             }
@@ -617,6 +792,9 @@ impl StreamRenderer {
 
         if has_trailing_newline {
             out.execute(Print("\n"))?;
+        }
+        if extra_trailing_newlines > 0 {
+            out.execute(Print("\n".repeat(extra_trailing_newlines)))?;
         }
 
         Ok(())
@@ -1139,7 +1317,46 @@ mod tests {
             .unwrap();
 
         let rendered = String::from_utf8(out).unwrap();
-        assert_eq!(strip_ansi(&rendered), "Heading\n");
+        assert_eq!(strip_ansi(&rendered), "\nHeading\n\n");
+    }
+
+    #[test]
+    fn test_render_h1_adds_rule_and_spacing() {
+        let renderer = StreamRenderer::new();
+        let mut out = Vec::new();
+
+        renderer
+            .render_line_with_inline_formatting_to("# Title\n", &mut out)
+            .unwrap();
+
+        let rendered = String::from_utf8(out).unwrap();
+        assert_eq!(
+            strip_ansi(&rendered),
+            format!("\nTitle\n{}\n\n", HEADING_RULE_LINE)
+        );
+    }
+
+    #[test]
+    fn test_render_deep_headings_use_distinct_prefixes() {
+        let renderer = StreamRenderer::new();
+
+        let mut h4 = Vec::new();
+        renderer
+            .render_line_with_inline_formatting_to("#### Four\n", &mut h4)
+            .unwrap();
+        assert_eq!(strip_ansi(&String::from_utf8(h4).unwrap()), "▸ Four\n");
+
+        let mut h5 = Vec::new();
+        renderer
+            .render_line_with_inline_formatting_to("##### Five\n", &mut h5)
+            .unwrap();
+        assert_eq!(strip_ansi(&String::from_utf8(h5).unwrap()), "▹ Five\n");
+
+        let mut h6 = Vec::new();
+        renderer
+            .render_line_with_inline_formatting_to("###### Six\n", &mut h6)
+            .unwrap();
+        assert_eq!(strip_ansi(&String::from_utf8(h6).unwrap()), "· Six\n");
     }
 
     #[test]
