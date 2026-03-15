@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use crossterm::ExecutableCommand;
-use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
+use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
 use pulldown_cmark::{Event, Options, Parser, Tag};
 use std::io::{self, Write};
 use syntect::easy::HighlightLines;
@@ -291,6 +291,7 @@ impl MarkdownRenderer {
 /// Enables true streaming behavior where:
 /// - Plain text is rendered with inline markdown formatting applied in real-time
 /// - Code blocks are buffered and rendered with syntax highlighting when complete
+/// - Markdown tables are buffered as blocks and rendered with aligned columns
 /// - Fence markers (``` or ~~~) are detected automatically
 /// - Inline formatting (bold, italic, inline code, headers) is applied during streaming
 ///
@@ -300,11 +301,40 @@ pub struct StreamRenderer {
     renderer: MarkdownRenderer,
     buffer: String,
     in_code_block: bool,
-    code_fence_chars: String,
+    active_fence: Option<FenceMarker>,
     line_buffer: String,
-    inline_buffer: String,
+    pending_table_header: Option<PendingTableHeader>,
+    active_table_block: Option<ActiveTableBlock>,
     inline_colors: InlineColors,
     plain_text_mode: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FenceMarker {
+    ch: char,
+    len: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableAlignment {
+    Left,
+    Center,
+    Right,
+}
+
+#[derive(Debug, Clone)]
+struct PendingTableHeader {
+    raw_line: String,
+    indent: String,
+    cells: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveTableBlock {
+    indent: String,
+    headers: Vec<String>,
+    alignments: Vec<TableAlignment>,
+    rows: Vec<Vec<String>>,
 }
 
 impl StreamRenderer {
@@ -322,9 +352,10 @@ impl StreamRenderer {
             renderer: MarkdownRenderer::new(),
             buffer: String::new(),
             in_code_block: false,
-            code_fence_chars: String::new(),
+            active_fence: None,
             line_buffer: String::new(),
-            inline_buffer: String::new(),
+            pending_table_header: None,
+            active_table_block: None,
             inline_colors: InlineColors::default(),
             plain_text_mode: true,
         }
@@ -340,9 +371,10 @@ impl StreamRenderer {
             renderer: MarkdownRenderer::with_theme(theme_name, inline_colors.clone()),
             buffer: String::new(),
             in_code_block: false,
-            code_fence_chars: String::new(),
+            active_fence: None,
             line_buffer: String::new(),
-            inline_buffer: String::new(),
+            pending_table_header: None,
+            active_table_block: None,
             inline_colors,
             plain_text_mode: false,
         }
@@ -354,7 +386,8 @@ impl StreamRenderer {
     /// line is received:
     /// - Code fence markers (``` or ~~~) are detected to track code block boundaries
     /// - Inside code blocks: text is buffered for later syntax highlighting
-    /// - Outside code blocks: lines are rendered with inline markdown formatting applied
+    /// - Markdown tables are buffered until complete so columns can be aligned
+    /// - Outside code/table blocks: lines are rendered with markdown formatting applied
     ///
     /// In plain text mode, all text is printed as-is without any processing.
     ///
@@ -376,38 +409,29 @@ impl StreamRenderer {
 
             // Check if we have a complete line
             if ch == '\n' {
-                let line = self.line_buffer.clone();
-                self.line_buffer.clear();
+                let line = std::mem::take(&mut self.line_buffer);
 
-                // Check for code fence markers (```, ~~~)
-                let trimmed = line.trim_start();
-                if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-                    if !self.in_code_block {
-                        // Starting a code block
-                        self.in_code_block = true;
-                        self.code_fence_chars = if trimmed.starts_with("```") {
-                            "```".to_string()
-                        } else {
-                            "~~~".to_string()
-                        };
-                        self.buffer.push_str(&line);
-                    } else if trimmed.starts_with(&self.code_fence_chars) {
+                if self.in_code_block {
+                    if is_matching_fence_closer(&line, self.active_fence) {
                         // Ending a code block - add the closing fence and render
                         self.buffer.push_str(&line);
                         self.renderer.render(&self.buffer)?;
                         self.buffer.clear();
                         self.in_code_block = false;
-                        self.code_fence_chars.clear();
+                        self.active_fence = None;
                     } else {
-                        // Code inside the block
+                        // Code inside the block - keep buffering
                         self.buffer.push_str(&line);
                     }
-                } else if self.in_code_block {
-                    // Inside code block - keep buffering
+                } else if let Some(fence) = parse_fence_opener(&line) {
+                    self.flush_pending_tables()?;
+                    // Starting a code block
+                    self.in_code_block = true;
+                    self.active_fence = Some(fence);
                     self.buffer.push_str(&line);
                 } else {
-                    // Regular text - apply simple inline formatting and print
-                    self.render_line_with_inline_formatting(&line)?;
+                    // Regular text - render markdown inline/block elements for this line
+                    self.process_regular_line(line)?;
                 }
             }
         }
@@ -415,155 +439,271 @@ impl StreamRenderer {
         Ok(())
     }
 
-    /// Render a line with simple inline markdown formatting applied.
-    ///
-    /// Applies terminal formatting for common markdown patterns:
-    /// - `**bold**` → bold terminal text
-    /// - `*italic*` → colored terminal text
-    /// - `` `code` `` → colored terminal text
-    /// - `# heading` → colored terminal text
-    ///
-    /// Colors are determined by the configured inline_colors.
-    /// This provides basic markdown rendering while maintaining true streaming behavior.
-    fn render_line_with_inline_formatting(&mut self, line: &str) -> Result<()> {
+    fn process_regular_line(&mut self, line: String) -> Result<()> {
         let mut stdout = io::stdout();
+        self.process_regular_line_to(line, &mut stdout)?;
+        stdout.flush()?;
+        Ok(())
+    }
 
-        self.inline_buffer.push_str(line);
-        let mut line = std::mem::take(&mut self.inline_buffer);
-        let has_trailing_newline = line.ends_with('\n');
-        if has_trailing_newline {
-            line.pop();
+    fn process_regular_line_to<W: Write>(&mut self, line: String, out: &mut W) -> Result<()> {
+        loop {
+            if let Some(active_table) = self.active_table_block.as_mut() {
+                if let Some((indent, cells)) = parse_table_row(&line) {
+                    if indent == active_table.indent && cells.len() == active_table.headers.len() {
+                        active_table.rows.push(cells);
+                        return Ok(());
+                    }
+                }
+
+                if let Some(table) = self.active_table_block.take() {
+                    self.render_table_block_to(&table, out)?;
+                }
+            }
+
+            if let Some(pending_header) = self.pending_table_header.take() {
+                if let Some((indent, alignments)) =
+                    parse_table_separator(&line, pending_header.cells.len())
+                {
+                    if indent == pending_header.indent {
+                        self.active_table_block = Some(ActiveTableBlock {
+                            indent: pending_header.indent,
+                            headers: pending_header.cells,
+                            alignments,
+                            rows: Vec::new(),
+                        });
+                        return Ok(());
+                    }
+                }
+
+                self.render_line_with_inline_formatting_to(&pending_header.raw_line, out)?;
+                continue;
+            }
+
+            if let Some(header) = parse_table_header_candidate(&line) {
+                self.pending_table_header = Some(header);
+                return Ok(());
+            }
+
+            self.render_line_with_inline_formatting_to(&line, out)?;
+            return Ok(());
+        }
+    }
+
+    fn render_line_with_inline_formatting_to<W: Write>(
+        &self,
+        line: &str,
+        out: &mut W,
+    ) -> Result<()> {
+        let (content, has_trailing_newline) = strip_single_trailing_newline(line);
+
+        let mut options = Options::empty();
+        options.insert(Options::ENABLE_STRIKETHROUGH);
+        options.insert(Options::ENABLE_TABLES);
+        let parser = Parser::new_ext(content, options);
+
+        let mut list_stack: Vec<Option<u64>> = Vec::new();
+        let mut link_dest_stack: Vec<String> = Vec::new();
+
+        for event in parser {
+            match event {
+                Event::Start(Tag::Heading(..)) => {
+                    out.execute(SetForegroundColor(self.inline_colors.get_heading_color()))?
+                        .execute(SetAttribute(Attribute::Bold))?;
+                }
+                Event::End(Tag::Heading(..)) => {
+                    out.execute(SetAttribute(Attribute::Reset))?
+                        .execute(ResetColor)?;
+                }
+                Event::Start(Tag::Strong) => {
+                    out.execute(SetForegroundColor(self.inline_colors.get_emphasis_color()))?
+                        .execute(SetAttribute(Attribute::Bold))?;
+                }
+                Event::End(Tag::Strong) => {
+                    out.execute(SetAttribute(Attribute::Reset))?
+                        .execute(ResetColor)?;
+                }
+                Event::Start(Tag::Emphasis) => {
+                    out.execute(SetForegroundColor(self.inline_colors.get_emphasis_color()))?
+                        .execute(SetAttribute(Attribute::Italic))?;
+                }
+                Event::End(Tag::Emphasis) => {
+                    out.execute(SetAttribute(Attribute::Reset))?
+                        .execute(ResetColor)?;
+                }
+                Event::Start(Tag::Strikethrough) => {
+                    out.execute(SetForegroundColor(self.inline_colors.get_emphasis_color()))?
+                        .execute(SetAttribute(Attribute::CrossedOut))?;
+                }
+                Event::End(Tag::Strikethrough) => {
+                    out.execute(SetAttribute(Attribute::Reset))?
+                        .execute(ResetColor)?;
+                }
+                Event::Start(Tag::Link(_, destination, _)) => {
+                    link_dest_stack.push(destination.to_string());
+                    out.execute(SetForegroundColor(self.inline_colors.get_heading_color()))?
+                        .execute(SetAttribute(Attribute::Underlined))?;
+                }
+                Event::End(Tag::Link(..)) => {
+                    out.execute(SetAttribute(Attribute::Reset))?
+                        .execute(ResetColor)?;
+
+                    if let Some(destination) = link_dest_stack.pop() {
+                        if !destination.is_empty() {
+                            out.execute(Print(format!(" ({})", destination)))?;
+                        }
+                    }
+                }
+                Event::Start(Tag::BlockQuote) => {
+                    out.execute(SetForegroundColor(self.inline_colors.get_emphasis_color()))?
+                        .execute(Print("│ "))?;
+                }
+                Event::End(Tag::BlockQuote) => {
+                    out.execute(ResetColor)?;
+                }
+                Event::Start(Tag::List(start)) => {
+                    list_stack.push(start);
+                }
+                Event::End(Tag::List(_)) => {
+                    list_stack.pop();
+                }
+                Event::Start(Tag::Item) => {
+                    let depth = list_stack.len().saturating_sub(1);
+                    if depth > 0 {
+                        out.execute(Print("  ".repeat(depth)))?;
+                    }
+
+                    if let Some(last) = list_stack.last_mut() {
+                        match last {
+                            Some(next_index) => {
+                                out.execute(Print(format!("{}. ", *next_index)))?;
+                                *next_index += 1;
+                            }
+                            None => {
+                                out.execute(Print("• "))?;
+                            }
+                        }
+                    } else {
+                        out.execute(Print("• "))?;
+                    }
+                }
+                Event::TaskListMarker(checked) => {
+                    out.execute(Print(if checked { "[x] " } else { "[ ] " }))?;
+                }
+                Event::Text(text) | Event::Html(text) => {
+                    out.execute(Print(&*text))?;
+                }
+                Event::Code(code) => {
+                    out.execute(SetForegroundColor(
+                        self.inline_colors.get_inline_code_color(),
+                    ))?
+                    .execute(Print("`"))?
+                    .execute(Print(&*code))?
+                    .execute(Print("`"))?
+                    .execute(ResetColor)?;
+                }
+                Event::SoftBreak => {
+                    out.execute(Print(" "))?;
+                }
+                Event::HardBreak => {
+                    out.execute(Print("\n"))?;
+                }
+                Event::Rule => {
+                    out.execute(Print("────────────────────────────────────────"))?;
+                }
+                _ => {}
+            }
         }
 
-        // Check if line is a header
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("# ") {
-            stdout
-                .execute(SetForegroundColor(self.inline_colors.get_heading_color()))?
-                .execute(Print(&line))?
-                .execute(ResetColor)?;
-            stdout.flush()?;
+        if has_trailing_newline {
+            out.execute(Print("\n"))?;
+        }
+
+        Ok(())
+    }
+
+    fn flush_pending_tables(&mut self) -> Result<()> {
+        let mut stdout = io::stdout();
+        self.flush_pending_tables_to(&mut stdout)?;
+        stdout.flush()?;
+        Ok(())
+    }
+
+    fn flush_pending_tables_to<W: Write>(&mut self, out: &mut W) -> Result<()> {
+        if let Some(table) = self.active_table_block.take() {
+            self.render_table_block_to(&table, out)?;
+        }
+
+        if let Some(pending_header) = self.pending_table_header.take() {
+            self.render_line_with_inline_formatting_to(&pending_header.raw_line, out)?;
+        }
+
+        Ok(())
+    }
+
+    fn render_table_block_to<W: Write>(&self, table: &ActiveTableBlock, out: &mut W) -> Result<()> {
+        let column_count = table
+            .headers
+            .len()
+            .max(table.alignments.len())
+            .max(table.rows.iter().map(|row| row.len()).max().unwrap_or(0));
+
+        if column_count == 0 {
             return Ok(());
         }
 
-        // Process line for inline formatting
-        let chars: Vec<char> = line.chars().collect();
-        let mut i = 0;
-        let mut pending_start = 0;
-
-        while i < chars.len() {
-            // Check for inline code `...`
-            if chars[i] == '`' && i + 1 < chars.len() {
-                if let Some(end) = chars[i + 1..].iter().position(|&c| c == '`') {
-                    // Found inline code
-                    if i > pending_start {
-                        let text: String = chars[pending_start..i].iter().collect();
-                        stdout.execute(Print(&text))?;
-                    }
-                    let code: String = chars[i + 1..i + 1 + end].iter().collect();
-                    stdout
-                        .execute(SetForegroundColor(
-                            self.inline_colors.get_inline_code_color(),
-                        ))?
-                        .execute(Print("`"))?
-                        .execute(Print(&code))?
-                        .execute(Print("`"))?
-                        .execute(ResetColor)?;
-                    i += end + 2;
-                    pending_start = i;
-                    continue;
-                } else if !has_trailing_newline {
-                    if i > pending_start {
-                        let text: String = chars[pending_start..i].iter().collect();
-                        stdout.execute(Print(&text))?;
-                    }
-                    let tail: String = chars[i..].iter().collect();
-                    self.inline_buffer.push_str(&tail);
-                    stdout.flush()?;
-                    return Ok(());
-                }
+        let mut widths = vec![0usize; column_count];
+        for (idx, cell) in table.headers.iter().enumerate() {
+            widths[idx] = widths[idx].max(cell.chars().count());
+        }
+        for row in &table.rows {
+            for (idx, cell) in row.iter().enumerate() {
+                widths[idx] = widths[idx].max(cell.chars().count());
             }
-
-            // Check for bold **...**
-            if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '*' {
-                if let Some(end) = find_closing_marker(&chars[i + 2..], "**") {
-                    // Found bold text
-                    if i > pending_start {
-                        let text: String = chars[pending_start..i].iter().collect();
-                        stdout.execute(Print(&text))?;
-                    }
-                    let text: String = chars[i + 2..i + 2 + end].iter().collect();
-                    stdout
-                        .execute(SetForegroundColor(self.inline_colors.get_emphasis_color()))?
-                        .execute(crossterm::style::SetAttribute(
-                            crossterm::style::Attribute::Bold,
-                        ))?
-                        .execute(Print(&text))?
-                        .execute(crossterm::style::SetAttribute(
-                            crossterm::style::Attribute::Reset,
-                        ))?
-                        .execute(ResetColor)?;
-                    i += end + 4;
-                    pending_start = i;
-                    continue;
-                } else if !has_trailing_newline {
-                    if i > pending_start {
-                        let text: String = chars[pending_start..i].iter().collect();
-                        stdout.execute(Print(&text))?;
-                    }
-                    let tail: String = chars[i..].iter().collect();
-                    self.inline_buffer.push_str(&tail);
-                    stdout.flush()?;
-                    return Ok(());
-                }
-            }
-
-            // Check for italic *...*
-            if chars[i] == '*' && !(i + 1 < chars.len() && chars[i + 1] == '*') {
-                if let Some(end) = chars[i + 1..].iter().position(|&c| c == '*') {
-                    // Found italic text
-                    if i > pending_start {
-                        let text: String = chars[pending_start..i].iter().collect();
-                        stdout.execute(Print(&text))?;
-                    }
-                    let text: String = chars[i + 1..i + 1 + end].iter().collect();
-                    stdout
-                        .execute(SetForegroundColor(self.inline_colors.get_emphasis_color()))?
-                        .execute(crossterm::style::SetAttribute(
-                            crossterm::style::Attribute::Italic,
-                        ))?
-                        .execute(Print(&text))?
-                        .execute(crossterm::style::SetAttribute(
-                            crossterm::style::Attribute::Reset,
-                        ))?
-                        .execute(ResetColor)?;
-                    i += end + 2;
-                    pending_start = i;
-                    continue;
-                } else if !has_trailing_newline {
-                    if i > pending_start {
-                        let text: String = chars[pending_start..i].iter().collect();
-                        stdout.execute(Print(&text))?;
-                    }
-                    let tail: String = chars[i..].iter().collect();
-                    self.inline_buffer.push_str(&tail);
-                    stdout.flush()?;
-                    return Ok(());
-                }
-            }
-
-            i += 1;
         }
 
-        if pending_start < chars.len() {
-            let text: String = chars[pending_start..].iter().collect();
-            stdout.execute(Print(&text))?;
+        out.execute(Print(table_border_line(
+            &table.indent,
+            &widths,
+            '┌',
+            '┬',
+            '┐',
+        )))?;
+        out.execute(Print("\n"))?;
+        out.execute(Print(table_row_line(
+            &table.indent,
+            &table.headers,
+            &widths,
+            &table.alignments,
+        )))?;
+        out.execute(Print("\n"))?;
+        out.execute(Print(table_border_line(
+            &table.indent,
+            &widths,
+            '├',
+            '┼',
+            '┤',
+        )))?;
+        out.execute(Print("\n"))?;
+
+        for row in &table.rows {
+            out.execute(Print(table_row_line(
+                &table.indent,
+                row,
+                &widths,
+                &table.alignments,
+            )))?;
+            out.execute(Print("\n"))?;
         }
 
-        if has_trailing_newline {
-            stdout.execute(Print("\n"))?;
-        }
-        stdout.flush()?;
+        out.execute(Print(table_border_line(
+            &table.indent,
+            &widths,
+            '└',
+            '┴',
+            '┘',
+        )))?;
+        out.execute(Print("\n"))?;
         Ok(())
     }
 
@@ -589,24 +729,23 @@ impl StreamRenderer {
         if !self.line_buffer.is_empty() {
             if self.in_code_block {
                 self.buffer.push_str(&self.line_buffer);
+                self.line_buffer.clear();
             } else {
-                // Render remaining line with inline formatting
-                let line = self.line_buffer.clone();
-                self.render_line_with_inline_formatting(&line)?;
+                // Process remaining regular line (may finalize a pending table)
+                let line = std::mem::take(&mut self.line_buffer);
+                self.process_regular_line(line)?;
             }
-            self.line_buffer.clear();
         }
 
         // Render any remaining buffered code block
         if !self.buffer.is_empty() {
             self.renderer.render(&self.buffer)?;
             self.buffer.clear();
+            self.in_code_block = false;
+            self.active_fence = None;
         }
 
-        if !self.inline_buffer.is_empty() {
-            print!("{}", self.inline_buffer);
-            self.inline_buffer.clear();
-        }
+        self.flush_pending_tables()?;
 
         Ok(())
     }
@@ -624,23 +763,272 @@ impl Default for StreamRenderer {
     }
 }
 
-/// Helper function to find closing marker in character slice
-fn find_closing_marker(chars: &[char], marker: &str) -> Option<usize> {
-    let marker_chars: Vec<char> = marker.chars().collect();
-    let marker_len = marker_chars.len();
+fn strip_single_trailing_newline(line: &str) -> (&str, bool) {
+    if let Some(stripped) = line.strip_suffix("\r\n") {
+        (stripped, true)
+    } else if let Some(stripped) = line.strip_suffix('\n') {
+        (stripped, true)
+    } else {
+        (line, false)
+    }
+}
 
-    for i in 0..chars.len() {
-        if i + marker_len <= chars.len() && chars[i..i + marker_len] == marker_chars[..] {
-            return Some(i);
+fn leading_markdown_indent(line: &str) -> Option<usize> {
+    let mut indent = 0usize;
+    for (idx, ch) in line.char_indices() {
+        match ch {
+            ' ' => {
+                indent += 1;
+                if indent > 3 {
+                    return None;
+                }
+            }
+            '\t' => {
+                return None;
+            }
+            _ => return Some(idx),
         }
     }
-    None
+    Some(line.len())
+}
+
+fn parse_fence_sequence(line: &str) -> Option<(char, usize, &str)> {
+    let (without_newline, _) = strip_single_trailing_newline(line);
+    let content = without_newline
+        .strip_suffix('\r')
+        .unwrap_or(without_newline);
+
+    let start = leading_markdown_indent(content)?;
+    let mut chars = content[start..].chars();
+    let marker = chars.next()?;
+    if marker != '`' && marker != '~' {
+        return None;
+    }
+
+    let mut len = 1usize;
+    let mut bytes_consumed = marker.len_utf8();
+    for ch in chars {
+        if ch == marker {
+            len += 1;
+            bytes_consumed += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    if len < 3 {
+        return None;
+    }
+
+    let remainder = &content[start + bytes_consumed..];
+    Some((marker, len, remainder))
+}
+
+fn parse_fence_opener(line: &str) -> Option<FenceMarker> {
+    let (ch, len, _) = parse_fence_sequence(line)?;
+    Some(FenceMarker { ch, len })
+}
+
+fn parse_table_header_candidate(line: &str) -> Option<PendingTableHeader> {
+    let (indent, cells) = parse_table_row(line)?;
+    if cells.len() < 2 {
+        return None;
+    }
+
+    Some(PendingTableHeader {
+        raw_line: line.to_string(),
+        indent,
+        cells,
+    })
+}
+
+fn parse_table_separator(
+    line: &str,
+    expected_cols: usize,
+) -> Option<(String, Vec<TableAlignment>)> {
+    let (indent, cells) = parse_table_row(line)?;
+    if cells.len() != expected_cols {
+        return None;
+    }
+
+    let alignments = cells
+        .iter()
+        .map(|cell| parse_table_alignment(cell))
+        .collect::<Option<Vec<_>>>()?;
+
+    Some((indent, alignments))
+}
+
+fn parse_table_row(line: &str) -> Option<(String, Vec<String>)> {
+    let (without_newline, _) = strip_single_trailing_newline(line);
+    let content = without_newline
+        .strip_suffix('\r')
+        .unwrap_or(without_newline);
+    let prefix_len = content.len() - content.trim_start().len();
+    let indent = content[..prefix_len].to_string();
+    let trimmed = content.trim();
+
+    if !trimmed.starts_with('|') || !trimmed.ends_with('|') {
+        return None;
+    }
+
+    let inner = &trimmed[1..trimmed.len() - 1];
+    let cells = split_table_cells(inner);
+    if cells.is_empty() {
+        return None;
+    }
+
+    Some((indent, cells))
+}
+
+fn split_table_cells(inner: &str) -> Vec<String> {
+    let mut cells = Vec::new();
+    let mut current = String::new();
+    let mut chars = inner.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\\' && matches!(chars.peek(), Some('|')) {
+            current.push('|');
+            chars.next();
+            continue;
+        }
+
+        if ch == '|' {
+            cells.push(current.trim().to_string());
+            current.clear();
+        } else {
+            current.push(ch);
+        }
+    }
+
+    cells.push(current.trim().to_string());
+    cells
+}
+
+fn parse_table_alignment(cell: &str) -> Option<TableAlignment> {
+    let compact: String = cell.chars().filter(|ch| !ch.is_whitespace()).collect();
+    if compact.is_empty() {
+        return None;
+    }
+
+    let starts_colon = compact.starts_with(':');
+    let ends_colon = compact.ends_with(':');
+    let dashes = compact.trim_matches(':');
+    if dashes.len() < 3 || !dashes.chars().all(|ch| ch == '-') {
+        return None;
+    }
+
+    let alignment = match (starts_colon, ends_colon) {
+        (true, true) => TableAlignment::Center,
+        (false, true) => TableAlignment::Right,
+        _ => TableAlignment::Left,
+    };
+    Some(alignment)
+}
+
+fn table_border_line(
+    indent: &str,
+    widths: &[usize],
+    left: char,
+    middle: char,
+    right: char,
+) -> String {
+    let mut out = String::new();
+    out.push_str(indent);
+    out.push(left);
+
+    for (idx, width) in widths.iter().enumerate() {
+        out.push_str(&"─".repeat(*width + 2));
+        if idx + 1 < widths.len() {
+            out.push(middle);
+        }
+    }
+
+    out.push(right);
+    out
+}
+
+fn table_row_line(
+    indent: &str,
+    cells: &[String],
+    widths: &[usize],
+    alignments: &[TableAlignment],
+) -> String {
+    let mut out = String::new();
+    out.push_str(indent);
+    out.push('│');
+
+    for (idx, width) in widths.iter().enumerate() {
+        let cell = cells.get(idx).map(|s| s.as_str()).unwrap_or("");
+        let alignment = alignments.get(idx).copied().unwrap_or(TableAlignment::Left);
+        out.push(' ');
+        out.push_str(&padded_table_cell(cell, *width, alignment));
+        out.push(' ');
+        out.push('│');
+    }
+
+    out
+}
+
+fn padded_table_cell(content: &str, width: usize, alignment: TableAlignment) -> String {
+    let content_width = content.chars().count();
+    if content_width >= width {
+        return content.to_string();
+    }
+
+    let pad = width - content_width;
+    match alignment {
+        TableAlignment::Right => format!("{}{}", " ".repeat(pad), content),
+        TableAlignment::Center => {
+            let left = pad / 2;
+            let right = pad - left;
+            format!("{}{}{}", " ".repeat(left), content, " ".repeat(right))
+        }
+        TableAlignment::Left => format!("{}{}", content, " ".repeat(pad)),
+    }
+}
+
+fn is_matching_fence_closer(line: &str, active_fence: Option<FenceMarker>) -> bool {
+    let Some(active) = active_fence else {
+        return false;
+    };
+
+    let Some((ch, len, remainder)) = parse_fence_sequence(line) else {
+        return false;
+    };
+
+    if ch != active.ch || len < active.len {
+        return false;
+    }
+
+    remainder.trim().is_empty()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::InlineColors;
+
+    fn strip_ansi(input: &str) -> String {
+        let mut out = String::new();
+        let mut chars = input.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' && matches!(chars.peek(), Some('[')) {
+                chars.next(); // Skip '['
+                for c in chars.by_ref() {
+                    // End of CSI sequence
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+
+        out
+    }
 
     #[test]
     fn test_stream_renderer_accumulates_chunks() {
@@ -739,5 +1127,117 @@ mod tests {
         // This test just ensures the renderer can be created and chunks can be added
         let result = renderer.add_chunk("**bold** and `code`\n");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_render_heading_preserves_trailing_newline() {
+        let renderer = StreamRenderer::new();
+        let mut out = Vec::new();
+
+        renderer
+            .render_line_with_inline_formatting_to("## Heading\n", &mut out)
+            .unwrap();
+
+        let rendered = String::from_utf8(out).unwrap();
+        assert_eq!(strip_ansi(&rendered), "Heading\n");
+    }
+
+    #[test]
+    fn test_code_fence_matching_requires_same_marker_and_length() {
+        let fence = parse_fence_opener("````rust\n").unwrap();
+        assert_eq!(fence, FenceMarker { ch: '`', len: 4 });
+        assert!(!is_matching_fence_closer("```\n", Some(fence)));
+        assert!(is_matching_fence_closer("````\n", Some(fence)));
+        assert!(!is_matching_fence_closer("```` trailing\n", Some(fence)));
+        assert!(!is_matching_fence_closer("~~~~\n", Some(fence)));
+    }
+
+    #[test]
+    fn test_code_fence_opener_requires_indentation_of_three_spaces_or_less() {
+        assert!(parse_fence_opener("   ```rust\n").is_some());
+        assert!(parse_fence_opener("    ```rust\n").is_none());
+        assert!(parse_fence_opener("\t```rust\n").is_none());
+    }
+
+    #[test]
+    fn test_render_line_supports_lists_quotes_and_links() {
+        let renderer = StreamRenderer::new();
+
+        let mut list_out = Vec::new();
+        renderer
+            .render_line_with_inline_formatting_to("- item\n", &mut list_out)
+            .unwrap();
+        let list_rendered = String::from_utf8(list_out).unwrap();
+        assert_eq!(strip_ansi(&list_rendered), "• item\n");
+
+        let mut quote_out = Vec::new();
+        renderer
+            .render_line_with_inline_formatting_to("> quoted\n", &mut quote_out)
+            .unwrap();
+        let quote_rendered = String::from_utf8(quote_out).unwrap();
+        assert_eq!(strip_ansi(&quote_rendered), "│ quoted\n");
+
+        let mut link_out = Vec::new();
+        renderer
+            .render_line_with_inline_formatting_to(
+                "[Rust](https://www.rust-lang.org)\n",
+                &mut link_out,
+            )
+            .unwrap();
+        let link_rendered = String::from_utf8(link_out).unwrap();
+        assert_eq!(
+            strip_ansi(&link_rendered),
+            "Rust (https://www.rust-lang.org)\n"
+        );
+    }
+
+    #[test]
+    fn test_table_block_is_buffered_and_rendered_with_aligned_columns() {
+        let mut renderer = StreamRenderer::new();
+        let mut out = Vec::new();
+
+        renderer
+            .process_regular_line_to("| Name | Value |\n".to_string(), &mut out)
+            .unwrap();
+        assert!(out.is_empty());
+
+        renderer
+            .process_regular_line_to("| :--- | ---: |\n".to_string(), &mut out)
+            .unwrap();
+        assert!(out.is_empty());
+
+        renderer
+            .process_regular_line_to("| long-name | 7 |\n".to_string(), &mut out)
+            .unwrap();
+        assert!(out.is_empty());
+
+        renderer
+            .process_regular_line_to("after table\n".to_string(), &mut out)
+            .unwrap();
+
+        let rendered = strip_ansi(&String::from_utf8(out).unwrap());
+        assert!(rendered.contains("┌───────────┬───────┐"));
+        assert!(rendered.contains("│ Name      │ Value │"));
+        assert!(rendered.contains("│ long-name │     7 │"));
+        assert!(rendered.contains("└───────────┴───────┘"));
+        assert!(rendered.ends_with("after table\n"));
+    }
+
+    #[test]
+    fn test_table_candidate_falls_back_to_normal_line_when_separator_missing() {
+        let mut renderer = StreamRenderer::new();
+        let mut out = Vec::new();
+
+        renderer
+            .process_regular_line_to("| maybe | header |\n".to_string(), &mut out)
+            .unwrap();
+        assert!(out.is_empty());
+
+        renderer
+            .process_regular_line_to("plain text\n".to_string(), &mut out)
+            .unwrap();
+
+        let rendered = strip_ansi(&String::from_utf8(out).unwrap());
+        assert_eq!(rendered, "| maybe | header |\nplain text\n");
     }
 }
