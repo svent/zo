@@ -43,6 +43,7 @@ impl From<Option<ToolsCliMode>> for ToolMode {
 
 /// Parameters for the write_file tool
 #[derive(Serialize, Deserialize, JsonSchema, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct WriteFileParams {
     /// The file path to write to
     pub path: String,
@@ -62,6 +63,7 @@ impl TypedTool for WriteFileParams {
 
 /// Parameters for list_files(path)
 #[derive(Serialize, Deserialize, JsonSchema, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct ListFilesParams {
     /// Directory path to list (relative to workspace root)
     pub path: String,
@@ -79,6 +81,7 @@ impl TypedTool for ListFilesParams {
 
 /// Parameters for find(glob)
 #[derive(Serialize, Deserialize, JsonSchema, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct FindParams {
     /// Glob pattern to match against workspace-relative paths
     pub glob: String,
@@ -96,6 +99,7 @@ impl TypedTool for FindParams {
 
 /// Parameters for grep_regex(pattern, path_glob)
 #[derive(Serialize, Deserialize, JsonSchema, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct GrepRegexParams {
     /// Rust regular expression pattern
     pub pattern: String,
@@ -115,6 +119,7 @@ impl TypedTool for GrepRegexParams {
 
 /// Parameters for grep_exact(text, path_glob)
 #[derive(Serialize, Deserialize, JsonSchema, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct GrepExactParams {
     /// Exact text to search for
     pub text: String,
@@ -134,6 +139,7 @@ impl TypedTool for GrepExactParams {
 
 /// Parameters for read_file(path, start_line, end_line)
 #[derive(Serialize, Deserialize, JsonSchema, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct ReadFileParams {
     /// File path to read
     pub path: String,
@@ -155,6 +161,7 @@ impl TypedTool for ReadFileParams {
 
 /// Parameters for edit_file(path, old_string, new_string)
 #[derive(Serialize, Deserialize, JsonSchema, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct EditFileParams {
     /// File path to modify
     pub path: String,
@@ -176,6 +183,7 @@ impl TypedTool for EditFileParams {
 
 /// Parameters for replace_lines(path, start_line, end_line, new_content)
 #[derive(Serialize, Deserialize, JsonSchema, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct ReplaceLinesParams {
     /// File path to modify
     pub path: String,
@@ -650,7 +658,14 @@ pub fn run_read_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::de::DeserializeOwned;
+    use serde_json::json;
     use std::io::Write;
+
+    fn assert_unknown_field_rejected<T: DeserializeOwned>(value: serde_json::Value) {
+        let result = serde_json::from_value::<T>(value);
+        assert!(result.is_err());
+    }
 
     #[test]
     fn test_normalize_path_relative() {
@@ -742,5 +757,82 @@ mod tests {
         assert!(allowed.contains(hidden_file));
 
         fs::remove_file(hidden_file).ok();
+    }
+
+    #[test]
+    fn test_tool_params_reject_unknown_fields() {
+        assert_unknown_field_rejected::<WriteFileParams>(json!({
+            "path": "file.txt",
+            "content": "abc",
+            "start_line": 1
+        }));
+
+        assert_unknown_field_rejected::<ListFilesParams>(json!({
+            "path": ".",
+            "extra": true
+        }));
+
+        assert_unknown_field_rejected::<FindParams>(json!({
+            "glob": "*.rs",
+            "extra": true
+        }));
+
+        assert_unknown_field_rejected::<GrepRegexParams>(json!({
+            "pattern": "foo.*bar",
+            "path_glob": "**/*.rs",
+            "extra": true
+        }));
+
+        assert_unknown_field_rejected::<GrepExactParams>(json!({
+            "text": "needle",
+            "path_glob": "**/*",
+            "extra": true
+        }));
+
+        assert_unknown_field_rejected::<ReadFileParams>(json!({
+            "path": "file.txt",
+            "start_line": 1,
+            "end_line": 2,
+            "extra": true
+        }));
+
+        assert_unknown_field_rejected::<EditFileParams>(json!({
+            "path": "file.txt",
+            "old_string": "a",
+            "new_string": "b",
+            "extra": true
+        }));
+
+        assert_unknown_field_rejected::<ReplaceLinesParams>(json!({
+            "path": "file.txt",
+            "start_line": 2,
+            "end_line": 3,
+            "new_content": "x",
+            "extra": true
+        }));
+    }
+
+    #[test]
+    fn test_tool_params_accept_valid_payloads() {
+        let write_ok = serde_json::from_value::<WriteFileParams>(json!({
+            "path": "file.txt",
+            "content": "abc"
+        }));
+        assert!(write_ok.is_ok());
+
+        let read_ok = serde_json::from_value::<ReadFileParams>(json!({
+            "path": "file.txt",
+            "start_line": 1,
+            "end_line": 3
+        }));
+        assert!(read_ok.is_ok());
+
+        let replace_ok = serde_json::from_value::<ReplaceLinesParams>(json!({
+            "path": "file.txt",
+            "start_line": 1,
+            "end_line": 1,
+            "new_content": "x"
+        }));
+        assert!(replace_ok.is_ok());
     }
 }
