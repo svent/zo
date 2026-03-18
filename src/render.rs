@@ -12,35 +12,6 @@ use crate::config::InlineColors;
 
 const HEADING_RULE_LINE: &str = "────────────────────────────────────────";
 
-/// Parse a color name or hex string into a crossterm Color.
-///
-/// Supports:
-/// - Named colors: "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white", "grey"/"gray"
-/// - Hex colors: "#RRGGBB" format
-///
-/// Returns None if the color cannot be parsed.
-fn parse_color(color_name: &str) -> Option<Color> {
-    match color_name.to_lowercase().as_str() {
-        "black" => Some(Color::Black),
-        "red" => Some(Color::Red),
-        "green" => Some(Color::Green),
-        "yellow" => Some(Color::Yellow),
-        "blue" => Some(Color::Blue),
-        "magenta" => Some(Color::Magenta),
-        "cyan" => Some(Color::Cyan),
-        "white" => Some(Color::White),
-        "grey" | "gray" => Some(Color::Grey),
-        // RGB hex format: #RRGGBB
-        hex if hex.starts_with('#') && hex.len() == 7 => {
-            let r = u8::from_str_radix(&hex[1..3], 16).ok()?;
-            let g = u8::from_str_radix(&hex[3..5], 16).ok()?;
-            let b = u8::from_str_radix(&hex[5..7], 16).ok()?;
-            Some(Color::Rgb { r, g, b })
-        }
-        _ => None,
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 struct HeadingFormat {
     prefix: &'static str,
@@ -149,7 +120,7 @@ impl InlineColors {
     pub fn get_heading_color(&self) -> Color {
         self.heading
             .as_ref()
-            .and_then(|c| parse_color(c))
+            .and_then(|c| Self::parse_color(c))
             .unwrap_or(Color::Cyan)
     }
 
@@ -157,7 +128,7 @@ impl InlineColors {
     pub fn get_inline_code_color(&self) -> Color {
         self.inline_code
             .as_ref()
-            .and_then(|c| parse_color(c))
+            .and_then(|c| Self::parse_color(c))
             .unwrap_or(Color::Yellow)
     }
 
@@ -165,7 +136,7 @@ impl InlineColors {
     pub fn get_emphasis_color(&self) -> Color {
         self.emphasis
             .as_ref()
-            .and_then(|c| parse_color(c))
+            .and_then(|c| Self::parse_color(c))
             .unwrap_or(Color::White)
     }
 
@@ -173,7 +144,7 @@ impl InlineColors {
     pub fn get_prompt_color(&self) -> Color {
         self.prompt
             .as_ref()
-            .and_then(|c| parse_color(c))
+            .and_then(|c| Self::parse_color(c))
             .unwrap_or(Color::Cyan)
     }
 }
@@ -1239,17 +1210,26 @@ mod tests {
 
     #[test]
     fn test_parse_color_named() {
-        assert!(matches!(parse_color("red"), Some(Color::Red)));
-        assert!(matches!(parse_color("blue"), Some(Color::Blue)));
-        assert!(matches!(parse_color("cyan"), Some(Color::Cyan)));
-        assert!(matches!(parse_color("YELLOW"), Some(Color::Yellow))); // Case insensitive
-        assert!(matches!(parse_color("invalid"), None));
+        assert!(matches!(InlineColors::parse_color("red"), Some(Color::Red)));
+        assert!(matches!(
+            InlineColors::parse_color("lightblue"),
+            Some(Color::Blue)
+        ));
+        assert!(matches!(
+            InlineColors::parse_color("darkgray"),
+            Some(Color::DarkGrey)
+        ));
+        assert!(matches!(
+            InlineColors::parse_color("YELLOW"),
+            Some(Color::Yellow)
+        )); // Case insensitive
+        assert!(matches!(InlineColors::parse_color("invalid"), None));
     }
 
     #[test]
     fn test_parse_color_hex() {
         // Valid hex color
-        if let Some(Color::Rgb { r, g, b }) = parse_color("#FF8800") {
+        if let Some(Color::Rgb { r, g, b }) = InlineColors::parse_color("#FF8800") {
             assert_eq!(r, 255);
             assert_eq!(g, 136);
             assert_eq!(b, 0);
@@ -1258,8 +1238,8 @@ mod tests {
         }
 
         // Invalid hex
-        assert!(matches!(parse_color("#GGGGGG"), None));
-        assert!(matches!(parse_color("#FF"), None)); // Too short
+        assert!(matches!(InlineColors::parse_color("#GGGGGG"), None));
+        assert!(matches!(InlineColors::parse_color("#FF"), None)); // Too short
     }
 
     #[test]

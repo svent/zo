@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use crossterm::style::Color;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -95,6 +96,65 @@ impl InlineColors {
             Self::default()
         }
     }
+
+    /// Parse a named color or hex string into a terminal color.
+    ///
+    /// Supported values:
+    /// - Named colors: black, red/green/yellow/blue/magenta/cyan/white
+    /// - Dark variants: darkred/darkgreen/darkyellow/darkblue/darkmagenta/darkcyan
+    /// - Grays: grey/gray, darkgrey/darkgray
+    /// - Light aliases: lightred/lightgreen/lightyellow/lightblue/lightmagenta/lightcyan
+    /// - Hex colors: #RRGGBB
+    pub(crate) fn parse_color(value: &str) -> Option<Color> {
+        let normalized = value.trim().to_lowercase();
+        match normalized.as_str() {
+            "black" => Some(Color::Black),
+            "darkred" => Some(Color::DarkRed),
+            "red" | "lightred" => Some(Color::Red),
+            "darkgreen" => Some(Color::DarkGreen),
+            "green" | "lightgreen" => Some(Color::Green),
+            "darkyellow" => Some(Color::DarkYellow),
+            "yellow" | "lightyellow" => Some(Color::Yellow),
+            "darkblue" => Some(Color::DarkBlue),
+            "blue" | "lightblue" => Some(Color::Blue),
+            "darkmagenta" => Some(Color::DarkMagenta),
+            "magenta" | "lightmagenta" => Some(Color::Magenta),
+            "darkcyan" => Some(Color::DarkCyan),
+            "cyan" | "lightcyan" => Some(Color::Cyan),
+            "grey" | "gray" => Some(Color::Grey),
+            "darkgrey" | "darkgray" => Some(Color::DarkGrey),
+            "white" => Some(Color::White),
+            // RGB hex format: #RRGGBB
+            hex if hex.starts_with('#') && hex.len() == 7 => {
+                let r = u8::from_str_radix(&hex[1..3], 16).ok()?;
+                let g = u8::from_str_radix(&hex[3..5], 16).ok()?;
+                let b = u8::from_str_radix(&hex[5..7], 16).ok()?;
+                Some(Color::Rgb { r, g, b })
+            }
+            _ => None,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.validate_field("heading", &self.heading)?;
+        self.validate_field("inline_code", &self.inline_code)?;
+        self.validate_field("emphasis", &self.emphasis)?;
+        self.validate_field("prompt", &self.prompt)?;
+        Ok(())
+    }
+
+    fn validate_field(&self, field_name: &str, value: &Option<String>) -> Result<()> {
+        if let Some(color_value) = value {
+            if Self::parse_color(color_value).is_none() {
+                anyhow::bail!(
+                    "Invalid inline_colors.{} value '{}'. Use a supported named color (e.g., cyan, lightblue, darkgray) or hex color #RRGGBB.",
+                    field_name,
+                    color_value
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Get the config file path.
@@ -145,6 +205,7 @@ pub fn load_config() -> Result<Config> {
 /// - Custom model IDs are not empty
 /// - No duplicate custom model names
 /// - Theme name is valid (if specified)
+/// - Inline color values are valid (if specified)
 fn validate_config(config: &Config) -> Result<()> {
     // Track custom model names to detect duplicates
     let mut seen_names = std::collections::HashSet::new();
@@ -189,6 +250,11 @@ fn validate_config(config: &Config) -> Result<()> {
                 available.join(", ")
             );
         }
+    }
+
+    // Validate inline colors if specified
+    if let Some(inline_colors) = &config.inline_colors {
+        inline_colors.validate()?;
     }
 
     Ok(())
@@ -347,6 +413,75 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid theme"));
     }
+
+    #[test]
+    fn test_validate_config_valid_inline_colors() {
+        let config = Config {
+            api_key: None,
+            default_model: None,
+            models: None,
+            custom_models: vec![],
+            theme: None,
+            inline_colors: Some(InlineColors {
+                heading: Some("lightblue".to_string()),
+                inline_code: Some("#FF8800".to_string()),
+                emphasis: Some("darkgray".to_string()),
+                prompt: Some("  CYAN ".to_string()),
+            }),
+            history_file: None,
+        };
+
+        let result = validate_config(&config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_config_invalid_inline_color_name() {
+        let config = Config {
+            api_key: None,
+            default_model: None,
+            models: None,
+            custom_models: vec![],
+            theme: None,
+            inline_colors: Some(InlineColors {
+                heading: Some("bluish".to_string()),
+                inline_code: None,
+                emphasis: None,
+                prompt: None,
+            }),
+            history_file: None,
+        };
+
+        let result = validate_config(&config);
+        assert!(result.is_err());
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("inline_colors.heading"));
+        assert!(error.contains("bluish"));
+    }
+
+    #[test]
+    fn test_validate_config_invalid_inline_color_hex() {
+        let config = Config {
+            api_key: None,
+            default_model: None,
+            models: None,
+            custom_models: vec![],
+            theme: None,
+            inline_colors: Some(InlineColors {
+                heading: None,
+                inline_code: Some("#12G45Z".to_string()),
+                emphasis: None,
+                prompt: None,
+            }),
+            history_file: None,
+        };
+
+        let result = validate_config(&config);
+        assert!(result.is_err());
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("inline_colors.inline_code"));
+        assert!(error.contains("#12G45Z"));
+    }
 }
 
 /// Save configuration to file.
@@ -459,7 +594,11 @@ theme = "base16-ocean.dark"
 
 # Custom colors for inline markdown elements
 # This allows you to customize the appearance of text formatting
-# Supported color names: black, red, green, yellow, blue, magenta, cyan, white, grey
+# Supported color names:
+#   black, red, green, yellow, blue, magenta, cyan, white
+#   darkred, darkgreen, darkyellow, darkblue, darkmagenta, darkcyan
+#   gray/grey, darkgray/darkgrey
+#   lightred, lightgreen, lightyellow, lightblue, lightmagenta, lightcyan
 # Or use hex format: "#RRGGBB"
 #
 # [inline_colors]

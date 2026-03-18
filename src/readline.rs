@@ -16,6 +16,7 @@ use rustyline::{
     Cmd, CompletionType, Config, EditMode, Editor, EventHandler, Helper, KeyCode, KeyEvent,
     Modifiers,
 };
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 /// Result of searching for a file marker in the input
@@ -202,6 +203,13 @@ impl Completer for FilePatternCompleter {
 /// Helper for rustyline that provides file pattern completion
 pub struct ZoHelper {
     completer: FilePatternCompleter,
+    input_color_ansi: String,
+}
+
+impl ZoHelper {
+    fn set_input_color(&mut self, color: Color) {
+        self.input_color_ansi = color_to_ansi(color);
+    }
 }
 
 impl Completer for ZoHelper {
@@ -225,7 +233,20 @@ impl Hinter for ZoHelper {
     }
 }
 
-impl Highlighter for ZoHelper {}
+impl Highlighter for ZoHelper {
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
+        if line.is_empty() {
+            return Cow::Borrowed(line);
+        }
+
+        Cow::Owned(format!("\x1b[{}m{}\x1b[0m", self.input_color_ansi, line))
+    }
+
+    fn highlight_char(&self, line: &str, _pos: usize, forced: bool) -> bool {
+        // Re-highlight on normal typing/cursor movement so color appears immediately.
+        !forced && !line.is_empty()
+    }
+}
 impl Validator for ZoHelper {}
 impl Helper for ZoHelper {}
 
@@ -249,6 +270,7 @@ impl ChatReadline {
 
         let helper = ZoHelper {
             completer: FilePatternCompleter,
+            input_color_ansi: color_to_ansi(Color::Cyan),
         };
 
         let mut editor = Editor::with_config(config)?;
@@ -286,6 +308,10 @@ impl ChatReadline {
     /// - Ok(None) - User wants to exit (Ctrl-D, "exit", "quit", "q")
     /// - Err(e) - Error occurred
     pub fn read_input(&mut self, prompt_color: Color) -> anyhow::Result<Option<String>> {
+        if let Some(helper) = self.editor.helper_mut() {
+            helper.set_input_color(prompt_color);
+        }
+
         // Build colored prompt
         let prompt = format!("\x1b[{}m> \x1b[0m", color_to_ansi(prompt_color));
 
@@ -428,5 +454,29 @@ mod tests {
     fn test_expand_tilde_no_tilde() {
         let result = expand_tilde("/absolute/path.txt");
         assert_eq!(result, PathBuf::from("/absolute/path.txt"));
+    }
+
+    #[test]
+    fn test_highlighter_colors_typed_input() {
+        let mut helper = ZoHelper {
+            completer: FilePatternCompleter,
+            input_color_ansi: color_to_ansi(Color::Cyan),
+        };
+
+        helper.set_input_color(Color::Magenta);
+        let colored = helper.highlight("hello", 0);
+        assert_eq!(colored, "\x1b[95mhello\x1b[0m");
+    }
+
+    #[test]
+    fn test_highlighter_requests_refresh_on_typed_chars() {
+        let helper = ZoHelper {
+            completer: FilePatternCompleter,
+            input_color_ansi: color_to_ansi(Color::Cyan),
+        };
+
+        assert!(helper.highlight_char("h", 1, false));
+        assert!(!helper.highlight_char("", 0, false));
+        assert!(!helper.highlight_char("hello", 5, true));
     }
 }
