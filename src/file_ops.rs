@@ -24,6 +24,12 @@ enum NewlineStyle {
     CrLf,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DiffStats {
+    added_lines: usize,
+    removed_lines: usize,
+}
+
 impl FileWriter {
     /// Create a new FileWriter with allowed files list
     pub fn new(
@@ -167,13 +173,16 @@ impl FileWriter {
             .with_context(|| format!("Failed to read existing file: {}", path.display()))?;
 
         println!("\n📝 Changes to {}:", path.display());
-        self.show_diff(&old_content, new_content)?;
+        let diff_stats = self.show_diff(&old_content, new_content)?;
 
         let approved = if self.auto_approve {
-            println!("✓ Auto-approved (--yes flag)\n");
+            println!(
+                "✓ Auto-approved (--yes flag, +{} / -{} lines)\n",
+                diff_stats.added_lines, diff_stats.removed_lines
+            );
             true
         } else {
-            self.ask_approval()?
+            self.ask_approval(diff_stats)?
         };
 
         if approved {
@@ -198,15 +207,22 @@ impl FileWriter {
     }
 
     /// Display colored diff between old and new content
-    fn show_diff(&self, old: &str, new: &str) -> Result<()> {
+    fn show_diff(&self, old: &str, new: &str) -> Result<DiffStats> {
         let mut stdout = io::stdout();
+        let mut stats = DiffStats::default();
 
         let diff = TextDiff::from_lines(old, new);
 
         for change in diff.iter_all_changes() {
             let (sign, color) = match change.tag() {
-                ChangeTag::Delete => ("-", Color::Red),
-                ChangeTag::Insert => ("+", Color::Green),
+                ChangeTag::Delete => {
+                    stats.removed_lines += 1;
+                    ("-", Color::Red)
+                }
+                ChangeTag::Insert => {
+                    stats.added_lines += 1;
+                    ("+", Color::Green)
+                }
                 ChangeTag::Equal => (" ", Color::Reset),
             };
 
@@ -216,16 +232,19 @@ impl FileWriter {
         }
 
         stdout.flush()?;
-        Ok(())
+        Ok(stats)
     }
 
     /// Ask user for approval
-    fn ask_approval(&self) -> Result<bool> {
+    fn ask_approval(&self, diff_stats: DiffStats) -> Result<bool> {
         let mut stdout = io::stdout();
         stdout
             .execute(SetForegroundColor(self.inline_colors.get_prompt_color()))?
             .execute(SetAttribute(Attribute::Bold))?
-            .execute(Print("Apply changes? [y/N]: "))?
+            .execute(Print(format!(
+                "Apply changes? [y/N] (+{}/-{} lines): ",
+                diff_stats.added_lines, diff_stats.removed_lines
+            )))?
             .execute(ResetColor)?;
         stdout.flush()?;
 
@@ -513,5 +532,19 @@ mod tests {
     fn test_split_replacement_lines_normalizes_crlf_input() {
         let lines = split_replacement_lines("x\r\ny\r\n");
         assert_eq!(lines, vec!["x".to_string(), "y".to_string()]);
+    }
+
+    #[test]
+    fn test_show_diff_returns_line_counts() {
+        let writer = FileWriter::new(vec![], true, false, true, InlineColors::default());
+
+        let stats = writer.show_diff("a\nb\nc\n", "a\nx\nc\nd\n").unwrap();
+        assert_eq!(
+            stats,
+            DiffStats {
+                added_lines: 2,
+                removed_lines: 1,
+            }
+        );
     }
 }
