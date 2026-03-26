@@ -547,7 +547,7 @@ pub fn init_config() -> Result<()> {
 
     // Generate config file with comments
     let config_content = r##"# zo Configuration File
-# https://github.com/yourusername/zo
+# https://github.com/svent/zo
 
 # OpenRouter API key
 # You can also set this via the OPENROUTER_API_KEY environment variable
@@ -559,18 +559,9 @@ pub fn init_config() -> Result<()> {
 # Use short names like "codex", "sonnet", "flash", "gpt4o", etc.
 default_model = "codex"
 
-# Model mappings (shortname -> OpenRouter model ID)
-# If you define this table, it completely overrides the built-in model list
-# This gives you full control over which models are available via slash commands
-#
-# Example - uncomment to use your own model list:
-# [models]
-# codex = "openai/gpt-5.3-codex"
-# flash = "google/gemini-2.5-flash"
-# pro = "google/gemini-3-pro-preview"
-# sonnet = "anthropic/claude-sonnet-4.5"
-# gpt4o = "openai/gpt-4o"
-# grok = "x-ai/grok-4"
+# Chat history file path (uncomment to enable history persistence)
+# When set, chat history will be saved and restored between sessions
+# history_file = "~/.zo/history.txt"
 
 # Syntax highlighting theme for code blocks
 # Available themes:
@@ -587,10 +578,6 @@ default_model = "codex"
 #
 # If you have a light terminal background, try "InspiredGitHub"!
 theme = "base16-ocean.dark"
-
-# Chat history file path (uncomment to enable history persistence)
-# When set, chat history will be saved and restored between sessions
-# history_file = "~/.zo/history.txt"
 
 # Custom colors for inline markdown elements
 # This allows you to customize the appearance of text formatting
@@ -613,6 +600,19 @@ theme = "base16-ocean.dark"
 # inline_code = "magenta"
 # emphasis = "black"
 # prompt = "blue"
+
+# Model mappings (shortname -> OpenRouter model ID)
+# If you define this table, it completely overrides the built-in model list
+# This gives you full control over which models are available via slash commands
+#
+# Example - uncomment to use your own model list:
+# [models]
+# codex = "openai/gpt-5.3-codex"
+# flash = "google/gemini-2.5-flash"
+# pro = "google/gemini-3-pro-preview"
+# sonnet = "anthropic/claude-sonnet-4.5"
+# gpt4o = "openai/gpt-4o"
+# grok = "x-ai/grok-4"
 
 # Custom model definitions
 # Define virtual model names that map to actual OpenRouter models
