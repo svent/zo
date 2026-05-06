@@ -1,4 +1,4 @@
-use crate::models::DEFAULT_TEXT_MODEL_NAME;
+use crate::models::{DEFAULT_MODELS, DEFAULT_TEXT_MODEL_NAME};
 use anyhow::{Context, Result};
 use crossterm::style::Color;
 use serde::{Deserialize, Serialize};
@@ -282,6 +282,100 @@ pub fn get_default_config() -> Config {
     }
 }
 
+fn build_default_models_example_block() -> String {
+    let mut block = String::from("# [models]\n");
+
+    for (name, model_id) in DEFAULT_MODELS {
+        block.push_str(&format!("# {} = \"{}\"\n", name, model_id));
+    }
+
+    block
+}
+
+fn render_init_config_content() -> String {
+    let default_models_example_block = build_default_models_example_block();
+
+    format!(
+        r##"# zo Configuration File
+# https://github.com/svent/zo
+
+# OpenRouter API key
+# You can also set this via the OPENROUTER_API_KEY environment variable
+# Get your API key from: https://openrouter.ai/keys
+# api_key = "sk-or-v1-..."
+
+# Default model to use when none is specified
+# This will be used if you don't provide a /model command or --model flag
+# Use short names like "codex", "sonnet", "flash", "gpt4o", etc.
+default_model = "{default_model}"
+
+# Chat history file path (uncomment to enable history persistence)
+# When set, chat history will be saved and restored between sessions
+# history_file = "~/.zo/history.txt"
+
+# Syntax highlighting theme for code blocks
+# Available themes:
+#   Dark themes (for dark terminal backgrounds):
+#     - "base16-ocean.dark" (default)
+#     - "base16-eighties.dark"
+#     - "base16-mocha.dark"
+#     - "Solarized (dark)"
+#   
+#   Light themes (for light terminal backgrounds):
+#     - "InspiredGitHub" (recommended for light backgrounds)
+#     - "base16-ocean.light"
+#     - "Solarized (light)"
+#
+# If you have a light terminal background, try "InspiredGitHub"!
+theme = "base16-ocean.dark"
+
+# Custom colors for inline markdown elements
+# This allows you to customize the appearance of text formatting
+# Supported color names:
+#   black, red, green, yellow, blue, magenta, cyan, white
+#   darkred, darkgreen, darkyellow, darkblue, darkmagenta, darkcyan
+#   gray/grey, darkgray/darkgrey
+#   lightred, lightgreen, lightyellow, lightblue, lightmagenta, lightcyan
+# Or use hex format: "#RRGGBB"
+#
+# [inline_colors]
+# heading = "cyan"        # Color for headers
+# inline_code = "yellow"  # Color for inline code
+# emphasis = "white"      # Color for italic and bold text
+# prompt = "cyan"         # Color for chat prompt symbol
+#
+# Example for light terminal backgrounds:
+# [inline_colors]
+# heading = "blue"
+# inline_code = "magenta"
+# emphasis = "black"
+# prompt = "blue"
+
+# Model mappings (shortname -> OpenRouter model ID)
+# If you define this table, it completely overrides the built-in model list
+# This gives you full control over which models are available via slash commands
+#
+# Example - uncomment to use your own model list:
+{default_models_example_block}
+# Custom model definitions
+# Define virtual model names that map to actual OpenRouter models
+# You can optionally include a system prompt for each custom model
+#
+# Example:
+# [[custom_models]]
+# name = "code"
+# model = "anthropic/claude-sonnet-4.5"
+# system_prompt = "You are an expert programmer. Provide concise, well-commented code."
+#
+# [[custom_models]]
+# name = "writer"
+# model = "openai/gpt-4o"
+# system_prompt = "You are a professional writer. Write clearly and engagingly."
+"##,
+        default_model = DEFAULT_TEXT_MODEL_NAME,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,6 +577,22 @@ mod tests {
         assert!(error.contains("inline_colors.inline_code"));
         assert!(error.contains("#12G45Z"));
     }
+
+    #[test]
+    fn test_render_init_config_content_uses_default_model_constant() {
+        let content = render_init_config_content();
+
+        assert!(content.contains(&format!("default_model = \"{}\"", DEFAULT_TEXT_MODEL_NAME)));
+    }
+
+    #[test]
+    fn test_render_init_config_content_lists_all_default_models() {
+        let content = render_init_config_content();
+
+        for (name, model_id) in DEFAULT_MODELS {
+            assert!(content.contains(&format!("# {} = \"{}\"", name, model_id)));
+        }
+    }
 }
 
 /// Save configuration to file.
@@ -520,7 +630,7 @@ pub fn save_config(config: &Config) -> Result<()> {
 ///
 /// Creates a new config file at the default location with:
 /// - Commented examples for all configuration options
-/// - Default model set to "codex"
+/// - Default model set to the built-in text default
 /// - Example custom model definitions
 /// - Instructions for getting an API key
 ///
@@ -547,89 +657,7 @@ pub fn init_config() -> Result<()> {
     }
 
     // Generate config file with comments
-    let config_content = r##"# zo Configuration File
-# https://github.com/svent/zo
-
-# OpenRouter API key
-# You can also set this via the OPENROUTER_API_KEY environment variable
-# Get your API key from: https://openrouter.ai/keys
-# api_key = "sk-or-v1-..."
-
-# Default model to use when none is specified
-# This will be used if you don't provide a /model command or --model flag
-# Use short names like "codex", "sonnet", "flash", "gpt4o", etc.
-default_model = "codex"
-
-# Chat history file path (uncomment to enable history persistence)
-# When set, chat history will be saved and restored between sessions
-# history_file = "~/.zo/history.txt"
-
-# Syntax highlighting theme for code blocks
-# Available themes:
-#   Dark themes (for dark terminal backgrounds):
-#     - "base16-ocean.dark" (default)
-#     - "base16-eighties.dark"
-#     - "base16-mocha.dark"
-#     - "Solarized (dark)"
-#   
-#   Light themes (for light terminal backgrounds):
-#     - "InspiredGitHub" (recommended for light backgrounds)
-#     - "base16-ocean.light"
-#     - "Solarized (light)"
-#
-# If you have a light terminal background, try "InspiredGitHub"!
-theme = "base16-ocean.dark"
-
-# Custom colors for inline markdown elements
-# This allows you to customize the appearance of text formatting
-# Supported color names:
-#   black, red, green, yellow, blue, magenta, cyan, white
-#   darkred, darkgreen, darkyellow, darkblue, darkmagenta, darkcyan
-#   gray/grey, darkgray/darkgrey
-#   lightred, lightgreen, lightyellow, lightblue, lightmagenta, lightcyan
-# Or use hex format: "#RRGGBB"
-#
-# [inline_colors]
-# heading = "cyan"        # Color for headers
-# inline_code = "yellow"  # Color for inline code
-# emphasis = "white"      # Color for italic and bold text
-# prompt = "cyan"         # Color for chat prompt symbol
-#
-# Example for light terminal backgrounds:
-# [inline_colors]
-# heading = "blue"
-# inline_code = "magenta"
-# emphasis = "black"
-# prompt = "blue"
-
-# Model mappings (shortname -> OpenRouter model ID)
-# If you define this table, it completely overrides the built-in model list
-# This gives you full control over which models are available via slash commands
-#
-# Example - uncomment to use your own model list:
-# [models]
-# codex = "openai/gpt-5.3-codex"
-# flash = "google/gemini-2.5-flash"
-# pro = "google/gemini-3-pro-preview"
-# sonnet = "anthropic/claude-sonnet-4.5"
-# gpt4o = "openai/gpt-4o"
-# grok = "x-ai/grok-4"
-
-# Custom model definitions
-# Define virtual model names that map to actual OpenRouter models
-# You can optionally include a system prompt for each custom model
-#
-# Example:
-# [[custom_models]]
-# name = "code"
-# model = "anthropic/claude-sonnet-4.5"
-# system_prompt = "You are an expert programmer. Provide concise, well-commented code."
-#
-# [[custom_models]]
-# name = "writer"
-# model = "openai/gpt-4o"
-# system_prompt = "You are a professional writer. Write clearly and engagingly."
-"##;
+    let config_content = render_init_config_content();
 
     // Write to file
     fs::write(&config_path, config_content)

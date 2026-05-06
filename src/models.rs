@@ -16,18 +16,19 @@ pub const DEFAULT_TEXT_MODEL_ID: &str = "openai/gpt-5.4";
 /// Default models mapping short names to OpenRouter model IDs
 pub const DEFAULT_MODELS: &[(&str, &str)] = &[
     (DEFAULT_TEXT_MODEL_NAME, DEFAULT_TEXT_MODEL_ID),
-    ("flash", "google/gemini-2.5-flash"),
-    ("geminipro", "google/gemini-3-pro-preview"),
+    ("flash", "google/gemini-flash-latest"),
+    ("geminipro", "google/gemini-pro-latest"),
     ("gpt4.1", "openai/gpt-4.1"),
     ("gpt4o", "openai/gpt-4o"),
     ("gpt4omini", "openai/gpt-4o-mini"),
-    ("gpt5", "openai/gpt-5"),
-    ("grok", "x-ai/grok-4"),
+    ("grok", "x-ai/grok-4.3"),
     ("haiku", "anthropic/claude-3-haiku"),
     ("o1", "openai/o1"),
     ("opus", "anthropic/claude-opus-4.6"),
     ("sonnet", "anthropic/claude-sonnet-4.5"),
     ("sonnet3", "anthropic/claude-3.5-sonnet"),
+    // image models
+    ("banana", "google/gemini-3-pro-image-preview"),
 ];
 
 /// Build model map from config or default models.
@@ -352,13 +353,13 @@ mod tests {
         );
         assert_eq!(
             model_map.get("flash").unwrap().model_id,
-            "google/gemini-2.5-flash"
+            "google/gemini-flash-latest"
         );
         assert_eq!(
             model_map.get("geminipro").unwrap().model_id,
-            "google/gemini-3-pro-preview"
+            "google/gemini-pro-latest"
         );
-        assert_eq!(model_map.get("grok").unwrap().model_id, "x-ai/grok-4");
+        assert_eq!(model_map.get("grok").unwrap().model_id, "x-ai/grok-4.3");
     }
 
     #[test]
@@ -543,7 +544,7 @@ mod tests {
         // Test partial match with suffix - "pro" should match "geminipro"
         let result = select_model("pro", &model_map, &config);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().model_id, "google/gemini-3-pro-preview");
+        assert_eq!(result.unwrap().model_id, "google/gemini-pro-latest");
     }
 
     #[test]
