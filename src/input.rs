@@ -534,6 +534,11 @@ fn read_file_if_exists(filename: &str) -> Result<String> {
 /// // Result: ParsedInput { model_override: None, prompt: "analyze", stdin_content: Some("..."), file_references: [] }
 /// ```
 pub fn parse_input(args: Vec<String>) -> Result<ParsedInput> {
+    let stdin_content = read_stdin_if_available().context("Failed to read from STDIN")?;
+    parse_input_with_stdin(args, stdin_content)
+}
+
+fn parse_input_with_stdin(args: Vec<String>, stdin_content: Option<String>) -> Result<ParsedInput> {
     // Join args into single string
     let joined = args.join(" ");
 
@@ -544,15 +549,37 @@ pub fn parse_input(args: Vec<String>) -> Result<ParsedInput> {
     let (final_prompt, file_references, output_files) =
         parse_file_patterns(&prompt).context("Failed to parse file patterns")?;
 
-    // Check if STDIN is available (not a TTY, meaning it's piped)
-    let stdin_content = read_stdin_if_available().context("Failed to read from STDIN")?;
-
     Ok(ParsedInput {
         model_override,
         prompt: final_prompt, // Use expanded prompt
         stdin_content,
         file_references,
         output_files,
+    })
+}
+
+/// Parse input for image mode.
+///
+/// Image prompts keep slash-model overrides and piped STDIN behavior, but skip all
+/// `@file`, `!file`, and `@!file` parsing so prompt text stays literal.
+pub fn parse_image_input(args: Vec<String>) -> Result<ParsedInput> {
+    let stdin_content = read_stdin_if_available().context("Failed to read from STDIN")?;
+    parse_image_input_with_stdin(args, stdin_content)
+}
+
+fn parse_image_input_with_stdin(
+    args: Vec<String>,
+    stdin_content: Option<String>,
+) -> Result<ParsedInput> {
+    let joined = args.join(" ");
+    let (model_override, prompt) = parse_slash_command(&joined);
+
+    Ok(ParsedInput {
+        model_override,
+        prompt,
+        stdin_content,
+        file_references: Vec::new(),
+        output_files: Vec::new(),
     })
 }
 
@@ -688,6 +715,54 @@ mod tests {
         assert_eq!(parsed.model_override, Some("gpt4".to_string()));
         assert_eq!(parsed.prompt, "");
         assert_eq!(parsed.file_references.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_image_input_with_slash_command() {
+        let parsed =
+            parse_image_input_with_stdin(vec!["/flash".to_string(), "draw".to_string()], None)
+                .unwrap();
+
+        assert_eq!(parsed.model_override, Some("flash".to_string()));
+        assert_eq!(parsed.prompt, "draw");
+        assert!(parsed.file_references.is_empty());
+        assert!(parsed.output_files.is_empty());
+    }
+
+    #[test]
+    fn test_parse_image_input_keeps_file_syntax_literal() {
+        let parsed = parse_image_input_with_stdin(
+            vec![
+                "@cat.png".to_string(),
+                "literal".to_string(),
+                "!output.png".to_string(),
+            ],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.prompt, "@cat.png literal !output.png");
+        assert!(parsed.file_references.is_empty());
+        assert!(parsed.output_files.is_empty());
+    }
+
+    #[test]
+    fn test_parse_image_input_preserves_stdin() {
+        let parsed = parse_image_input_with_stdin(
+            vec![
+                "/flash".to_string(),
+                "render".to_string(),
+                "@skyline.png".to_string(),
+            ],
+            Some("from stdin".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(parsed.model_override, Some("flash".to_string()));
+        assert_eq!(parsed.prompt, "render @skyline.png");
+        assert_eq!(parsed.stdin_content.as_deref(), Some("from stdin"));
+        assert!(parsed.file_references.is_empty());
+        assert!(parsed.output_files.is_empty());
     }
 
     #[test]

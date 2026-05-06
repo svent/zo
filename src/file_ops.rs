@@ -248,21 +248,61 @@ impl FileWriter {
             .execute(ResetColor)?;
         stdout.flush()?;
 
-        #[cfg(unix)]
-        {
-            use std::fs::File;
-            if let Ok(tty) = File::open("/dev/tty") {
-                let mut reader = io::BufReader::new(tty);
-                let mut response = String::new();
-                reader.read_line(&mut response)?;
-                return Ok(response.trim().eq_ignore_ascii_case("y"));
-            }
-        }
-
-        let mut response = String::new();
-        io::stdin().read_line(&mut response)?;
-        Ok(response.trim().eq_ignore_ascii_case("y"))
+        Ok(read_confirmation_response()?
+            .trim()
+            .eq_ignore_ascii_case("y"))
     }
+}
+
+fn read_confirmation_response() -> Result<String> {
+    #[cfg(unix)]
+    {
+        use std::fs::File;
+        if let Ok(tty) = File::open("/dev/tty") {
+            let mut reader = io::BufReader::new(tty);
+            let mut response = String::new();
+            reader.read_line(&mut response)?;
+            return Ok(response);
+        }
+    }
+
+    let mut response = String::new();
+    io::stdin().read_line(&mut response)?;
+    Ok(response)
+}
+
+fn resolve_binary_output_path(path: &str, allow_hidden: bool) -> Result<PathBuf> {
+    let resolved = resolve_workspace_path(path, true)?;
+    enforce_tool_path_policy(&resolved, path, allow_hidden)?;
+    Ok(resolved)
+}
+
+pub fn validate_binary_output_path(path: &str, allow_hidden: bool) -> Result<()> {
+    resolve_binary_output_path(path, allow_hidden).map(|_| ())
+}
+
+pub fn write_binary_file(
+    path: &str,
+    content: &[u8],
+    allow_hidden: bool,
+    auto_approve: bool,
+) -> Result<bool> {
+    let resolved = resolve_binary_output_path(path, allow_hidden)?;
+
+    if resolved.exists() && !auto_approve {
+        print!("Overwrite existing file? [y/N]: ");
+        io::stdout().flush()?;
+
+        if !read_confirmation_response()?
+            .trim()
+            .eq_ignore_ascii_case("y")
+        {
+            return Ok(false);
+        }
+    }
+
+    fs::write(&resolved, content).with_context(|| format!("Failed to write file: {}", path))?;
+    Ok(true)
 }
 
 fn split_lines_preserve_trailing(content: &str) -> (Vec<String>, bool, NewlineStyle) {
@@ -491,6 +531,61 @@ mod tests {
         assert!(allowed.unwrap());
 
         fs::remove_file(hidden_file).ok();
+    }
+
+    #[test]
+    fn test_write_binary_file_creates_new_file() {
+        let temp_file = "test_binary_output_new.png";
+        let _ = fs::remove_file(temp_file);
+
+        let result = write_binary_file(temp_file, &[0x89, 0x50, 0x4e, 0x47], false, true);
+        assert!(result.unwrap());
+
+        let bytes = fs::read(temp_file).unwrap();
+        assert_eq!(bytes, vec![0x89, 0x50, 0x4e, 0x47]);
+
+        fs::remove_file(temp_file).ok();
+    }
+
+    #[test]
+    fn test_write_binary_file_overwrites_with_yes() {
+        let temp_file = "test_binary_output_overwrite.jpg";
+        fs::write(temp_file, [0xff, 0xd8, 0xff]).unwrap();
+
+        let result = write_binary_file(temp_file, &[0x89, 0x50, 0x4e, 0x47], false, true);
+        assert!(result.unwrap());
+
+        let bytes = fs::read(temp_file).unwrap();
+        assert_eq!(bytes, vec![0x89, 0x50, 0x4e, 0x47]);
+
+        fs::remove_file(temp_file).ok();
+    }
+
+    #[test]
+    fn test_write_binary_file_blocks_hidden_path_by_default() {
+        let hidden_file = ".test_binary_hidden.png";
+        let _ = fs::remove_file(hidden_file);
+
+        let blocked = write_binary_file(hidden_file, &[1, 2, 3], false, true);
+        assert!(blocked.is_err());
+        assert!(blocked.unwrap_err().to_string().contains("--hidden"));
+
+        let allowed = write_binary_file(hidden_file, &[1, 2, 3], true, true);
+        assert!(allowed.unwrap());
+
+        fs::remove_file(hidden_file).ok();
+    }
+
+    #[test]
+    fn test_write_binary_file_enforces_workspace() {
+        let result = write_binary_file("../outside-workspace.png", &[1, 2, 3], false, true);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Path traversal not allowed")
+        );
     }
 
     #[test]

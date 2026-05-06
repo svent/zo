@@ -11,6 +11,7 @@ mod chat;
 mod client;
 mod config;
 mod file_ops;
+mod image;
 mod input;
 mod models;
 mod readline;
@@ -32,6 +33,7 @@ use tools::{ToolMode, ToolsCliMode};
     about = "Zettabyte Oracle - A CLI tool for interacting with language models via OpenRouter",
     override_usage = r#"zo [OPTIONS] [PROMPT]
        zo --chat
+       zo --image -o <FILE> [PROMPT]
        zo +ACTION"#,
     after_help = r#"
 Actions:
@@ -45,6 +47,7 @@ Examples:
     zo --tools rw "refactor the repo"
     zo --chat
     zo --chat "Let's talk"
+    zo --image -o assets/cat.png "Watercolor cat portrait"
     "#
 )]
 struct Cli {
@@ -68,6 +71,14 @@ struct Cli {
     #[arg(short, long)]
     chat: bool,
 
+    /// Generate a single image and exit
+    #[arg(long, requires = "output", conflicts_with_all = ["chat", "tools"])]
+    image: bool,
+
+    /// Save generated image to FILE (required with --image)
+    #[arg(short, long, value_name = "FILE", requires = "image")]
+    output: Option<String>,
+
     /// Automatically approve all file changes without confirmation
     #[arg(long, short = 'y')]
     yes: bool,
@@ -81,30 +92,12 @@ struct Cli {
     hidden: bool,
 }
 
-/// Resolve which model to use based on inputs and config
-///
-/// Priority order:
-/// 1. CLI --model flag
-/// 2. Slash command in prompt
-/// 3. Default model from config
-/// 4. Hardcoded fallback (codex)
+/// Resolve a named model using aliases, config overrides, and fuzzy matching.
 ///
 /// Returns (model_name, model_entry) tuple so we can display the short name in debug mode
-fn resolve_model(model_override: Option<String>, config: &Config) -> Result<(String, ModelEntry)> {
+fn resolve_named_model(model_name: String, config: &Config) -> Result<(String, ModelEntry)> {
     // Build model map from config and defaults
     let model_map = models::build_model_map(config);
-
-    // Determine which model name to use
-    let model_name = if let Some(override_name) = model_override {
-        // Use explicit override (from CLI flag or slash command)
-        override_name
-    } else if let Some(default_model) = &config.default_model {
-        // Use default model from config
-        default_model.clone()
-    } else {
-        // Hardcoded fallback to codex (openai/gpt-5.3-codex)
-        "codex".to_string()
-    };
 
     // Use fuzzy matching to find the model
     if let Some(model_entry) = models::select_model(&model_name, &model_map, config) {
@@ -128,6 +121,51 @@ fn resolve_model(model_override: Option<String>, config: &Config) -> Result<(Str
             error_msg.push_str(&format!("\n  {}", name));
         }
         bail!(error_msg);
+    }
+}
+
+/// Resolve a model for text/chat requests.
+///
+/// Priority order:
+/// 1. CLI --model flag
+/// 2. Slash command in prompt
+/// 3. Default model from config
+/// 4. Hardcoded fallback (codex)
+fn resolve_text_model(
+    model_override: Option<String>,
+    config: &Config,
+) -> Result<(String, ModelEntry)> {
+    let model_name = if let Some(override_name) = model_override {
+        override_name
+    } else if let Some(default_model) = &config.default_model {
+        default_model.clone()
+    } else {
+        "codex".to_string()
+    };
+
+    resolve_named_model(model_name, config)
+}
+
+/// Resolve a model for image requests.
+///
+/// Image mode honors explicit CLI/slash selection, otherwise it falls back to a
+/// built-in image-capable model instead of using the text default from config.
+fn resolve_image_model(
+    model_override: Option<String>,
+    config: &Config,
+) -> Result<(String, ModelEntry, bool)> {
+    if let Some(model_name) = model_override {
+        let (model_name, model_entry) = resolve_named_model(model_name, config)?;
+        Ok((model_name, model_entry, false))
+    } else {
+        Ok((
+            image::DEFAULT_IMAGE_MODEL_ID.to_string(),
+            ModelEntry {
+                model_id: image::DEFAULT_IMAGE_MODEL_ID.to_string(),
+                system_prompt: None,
+            },
+            true,
+        ))
     }
 }
 
@@ -229,6 +267,46 @@ fn display_debug_info(
     println!("\n==================\n");
 }
 
+fn display_image_debug_info(
+    model_name: &str,
+    model_entry: &ModelEntry,
+    prompt: &str,
+    output_path: &str,
+    modalities: &[openrouter_rs::api::chat::Modality],
+) {
+    println!("=== DEBUG MODE ===\n");
+
+    println!("Model Selected:");
+    println!("  Short name: {}", model_name);
+    println!("  Full ID:    {}", model_entry.model_id);
+
+    if let Some(system_prompt) = &model_entry.system_prompt {
+        println!("\nSystem Prompt:");
+        println!("  {}", system_prompt);
+    } else {
+        println!("\nSystem Prompt: (none)");
+    }
+
+    println!("\nDerived Modalities:");
+    println!("  {}", image::format_modalities(modalities));
+
+    println!("\nPrompt Preview:");
+    if prompt.len() > 500 {
+        println!(
+            "  {}... ({} more chars)",
+            &prompt[..500],
+            prompt.len() - 500
+        );
+    } else {
+        println!("  {}", prompt);
+    }
+
+    println!("\nOutput Path:");
+    println!("  {}", output_path);
+
+    println!("\n==================\n");
+}
+
 /// Ask user for confirmation before proceeding
 ///
 /// Returns true if user presses Enter (or types 'y'/'yes')
@@ -303,7 +381,7 @@ async fn main() -> Result<()> {
     }
 
     // If no arguments and not chat mode, show help
-    if cli.args.is_empty() && !cli.chat {
+    if cli.args.is_empty() && !cli.chat && !cli.image {
         use clap::CommandFactory;
         let mut cmd = Cli::command();
         cmd.print_help()?;
@@ -314,20 +392,91 @@ async fn main() -> Result<()> {
     // Load configuration
     let config = config::load_config().context("Failed to load configuration")?;
 
+    // Parse input (args + STDIN)
+    let parsed_input = if cli.image {
+        input::parse_image_input(cli.args.clone()).context("Failed to parse image input")?
+    } else {
+        input::parse_input(cli.args.clone()).context("Failed to parse input")?
+    };
+
+    // Determine final model override (CLI flag takes precedence over slash command)
+    let model_override = cli.model.clone().or(parsed_input.model_override.clone());
+
+    if cli.image {
+        let output_path = cli
+            .output
+            .clone()
+            .expect("clap should require --output when --image is set");
+        file_ops::validate_binary_output_path(&output_path, cli.hidden)
+            .context("Invalid image output path")?;
+
+        let has_content =
+            !parsed_input.prompt.trim().is_empty() || parsed_input.stdin_content.is_some();
+        if !has_content {
+            bail!("No prompt provided. Please provide a prompt or pipe input via STDIN.");
+        }
+
+        let user_message = session::build_user_message(
+            &[],
+            &parsed_input.prompt,
+            parsed_input.stdin_content.as_deref(),
+        );
+
+        let (model_name, model_entry, using_default_image_model) =
+            resolve_image_model(model_override, &config)
+                .context("Failed to resolve image model")?;
+
+        let client = client::create_client(&config).context("Failed to create API client")?;
+        let modalities = image::derive_image_modalities(
+            &client,
+            &model_entry.model_id,
+            using_default_image_model,
+        )
+        .await
+        .context("Failed to determine image output modalities")?;
+
+        if cli.debug {
+            display_image_debug_info(
+                &model_name,
+                &model_entry,
+                &user_message,
+                &output_path,
+                &modalities,
+            );
+
+            if !ask_for_confirmation()? {
+                println!("Cancelled.");
+                return Ok(());
+            }
+
+            println!();
+        }
+
+        image::run_image_generation(
+            client,
+            model_entry,
+            &user_message,
+            modalities,
+            image::ImageGenerationOptions {
+                output_path,
+                auto_approve: cli.yes,
+                allow_hidden: cli.hidden,
+            },
+        )
+        .await
+        .context("Image generation failed")?;
+
+        return Ok(());
+    }
+
     // Resolve tool mode from CLI
     let tool_mode = ToolMode::from(cli.tools);
     let show_tool_calls = cli.debug || cli.verbose;
     let show_full_tool_args = cli.debug;
 
-    // Parse input (args + STDIN)
-    let parsed_input = input::parse_input(cli.args.clone()).context("Failed to parse input")?;
-
-    // Determine final model override (CLI flag takes precedence over slash command)
-    let model_override = cli.model.or(parsed_input.model_override.clone());
-
     // Resolve which model to use (with fuzzy matching)
     let (model_name, model_entry) =
-        resolve_model(model_override, &config).context("Failed to resolve model")?;
+        resolve_text_model(model_override, &config).context("Failed to resolve model")?;
 
     // If debug mode is enabled, show diagnostic info and ask for confirmation
     if cli.debug {
@@ -476,5 +625,37 @@ mod tests {
     fn test_hidden_flag_present() {
         let cli = Cli::try_parse_from(["zo", "--hidden", "hello"]).unwrap();
         assert!(cli.hidden);
+    }
+
+    #[test]
+    fn test_image_requires_output() {
+        let result = Cli::try_parse_from(["zo", "--image", "hello"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_output_requires_image() {
+        let result = Cli::try_parse_from(["zo", "--output", "out.png", "hello"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_image_conflicts_with_chat() {
+        let result = Cli::try_parse_from(["zo", "--image", "--chat", "-o", "out.png", "hello"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_image_conflicts_with_tools() {
+        let result =
+            Cli::try_parse_from(["zo", "--image", "--tools", "ro", "-o", "out.png", "hello"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_image_output_flag_parses() {
+        let cli = Cli::try_parse_from(["zo", "--image", "-o", "out.png", "hello"]).unwrap();
+        assert!(cli.image);
+        assert_eq!(cli.output.as_deref(), Some("out.png"));
     }
 }
