@@ -1,3 +1,4 @@
+use crate::models::DEFAULT_TEXT_MODEL_NAME;
 use anyhow::{Context, Result};
 use crossterm::style::Color;
 use serde::{Deserialize, Serialize};
@@ -272,7 +273,7 @@ fn validate_config(config: &Config) -> Result<()> {
 pub fn get_default_config() -> Config {
     Config {
         api_key: None,
-        default_model: Some("codex".to_string()),
+        default_model: Some(DEFAULT_TEXT_MODEL_NAME.to_string()),
         models: None,
         custom_models: Vec::new(),
         theme: Some("base16-ocean.dark".to_string()),

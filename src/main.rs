@@ -130,20 +130,24 @@ fn resolve_named_model(model_name: String, config: &Config) -> Result<(String, M
 /// 1. CLI --model flag
 /// 2. Slash command in prompt
 /// 3. Default model from config
-/// 4. Hardcoded fallback (codex)
+/// 4. Built-in fallback model
 fn resolve_text_model(
     model_override: Option<String>,
     config: &Config,
 ) -> Result<(String, ModelEntry)> {
-    let model_name = if let Some(override_name) = model_override {
-        override_name
+    if let Some(override_name) = model_override {
+        resolve_named_model(override_name, config)
     } else if let Some(default_model) = &config.default_model {
-        default_model.clone()
+        resolve_named_model(default_model.clone(), config)
     } else {
-        "codex".to_string()
-    };
-
-    resolve_named_model(model_name, config)
+        Ok((
+            models::DEFAULT_TEXT_MODEL_ID.to_string(),
+            ModelEntry {
+                model_id: models::DEFAULT_TEXT_MODEL_ID.to_string(),
+                system_prompt: None,
+            },
+        ))
+    }
 }
 
 /// Resolve a model for image requests.
@@ -575,6 +579,46 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_resolve_text_model_uses_builtin_fallback_when_config_default_missing() {
+        let config = Config {
+            api_key: None,
+            default_model: None,
+            models: Some(std::collections::HashMap::new()),
+            custom_models: Vec::new(),
+            theme: None,
+            inline_colors: None,
+            history_file: None,
+        };
+
+        let (model_name, model_entry) = resolve_text_model(None, &config).unwrap();
+
+        assert_eq!(model_name, models::DEFAULT_TEXT_MODEL_ID);
+        assert_eq!(model_entry.model_id, models::DEFAULT_TEXT_MODEL_ID);
+        assert_eq!(model_entry.system_prompt, None);
+    }
+
+    #[test]
+    fn test_resolve_text_model_uses_config_default_when_present() {
+        let config = Config {
+            api_key: None,
+            default_model: Some("mydefault".to_string()),
+            models: Some(std::collections::HashMap::from([(
+                "mydefault".to_string(),
+                "provider/custom-model".to_string(),
+            )])),
+            custom_models: Vec::new(),
+            theme: None,
+            inline_colors: None,
+            history_file: None,
+        };
+
+        let (model_name, model_entry) = resolve_text_model(None, &config).unwrap();
+
+        assert_eq!(model_name, "mydefault");
+        assert_eq!(model_entry.model_id, "provider/custom-model");
+    }
 
     #[test]
     fn test_tools_flag_explicit_ro() {
