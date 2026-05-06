@@ -360,6 +360,72 @@ fn ask_for_confirmation() -> Result<bool> {
     }
 }
 
+async fn run_image_mode(
+    cli: &Cli,
+    config: &Config,
+    parsed_input: ParsedInput,
+    model_override: Option<String>,
+) -> Result<()> {
+    let output_path = cli
+        .output
+        .clone()
+        .expect("clap should require --output when --image is set");
+    file_ops::validate_binary_output_path(&output_path, cli.hidden)
+        .context("Invalid image output path")?;
+
+    let has_content =
+        !parsed_input.prompt.trim().is_empty() || parsed_input.stdin_content.is_some();
+    if !has_content {
+        bail!("No prompt provided. Please provide a prompt or pipe input via STDIN.");
+    }
+
+    let user_message = session::build_user_message(
+        &[],
+        &parsed_input.prompt,
+        parsed_input.stdin_content.as_deref(),
+    );
+
+    let (model_name, model_entry, using_default_image_model) =
+        resolve_image_model(model_override, config).context("Failed to resolve image model")?;
+
+    let client = client::create_client(config).context("Failed to create API client")?;
+    let modalities =
+        image::derive_image_modalities(&client, &model_entry.model_id, using_default_image_model)
+            .await
+            .context("Failed to determine image output modalities")?;
+
+    if cli.debug {
+        display_image_debug_info(
+            &model_name,
+            &model_entry,
+            &user_message,
+            &output_path,
+            &modalities,
+        );
+
+        if !ask_for_confirmation()? {
+            println!("Cancelled.");
+            return Ok(());
+        }
+
+        println!();
+    }
+
+    image::run_image_generation(
+        client,
+        model_entry,
+        &user_message,
+        modalities,
+        image::ImageGenerationOptions {
+            output_path,
+            auto_approve: cli.yes,
+            allow_hidden: cli.hidden,
+        },
+    )
+    .await
+    .context("Image generation failed")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Parse command-line arguments
@@ -407,70 +473,7 @@ async fn main() -> Result<()> {
     let model_override = cli.model.clone().or(parsed_input.model_override.clone());
 
     if cli.image {
-        let output_path = cli
-            .output
-            .clone()
-            .expect("clap should require --output when --image is set");
-        file_ops::validate_binary_output_path(&output_path, cli.hidden)
-            .context("Invalid image output path")?;
-
-        let has_content =
-            !parsed_input.prompt.trim().is_empty() || parsed_input.stdin_content.is_some();
-        if !has_content {
-            bail!("No prompt provided. Please provide a prompt or pipe input via STDIN.");
-        }
-
-        let user_message = session::build_user_message(
-            &[],
-            &parsed_input.prompt,
-            parsed_input.stdin_content.as_deref(),
-        );
-
-        let (model_name, model_entry, using_default_image_model) =
-            resolve_image_model(model_override, &config)
-                .context("Failed to resolve image model")?;
-
-        let client = client::create_client(&config).context("Failed to create API client")?;
-        let modalities = image::derive_image_modalities(
-            &client,
-            &model_entry.model_id,
-            using_default_image_model,
-        )
-        .await
-        .context("Failed to determine image output modalities")?;
-
-        if cli.debug {
-            display_image_debug_info(
-                &model_name,
-                &model_entry,
-                &user_message,
-                &output_path,
-                &modalities,
-            );
-
-            if !ask_for_confirmation()? {
-                println!("Cancelled.");
-                return Ok(());
-            }
-
-            println!();
-        }
-
-        image::run_image_generation(
-            client,
-            model_entry,
-            &user_message,
-            modalities,
-            image::ImageGenerationOptions {
-                output_path,
-                auto_approve: cli.yes,
-                allow_hidden: cli.hidden,
-            },
-        )
-        .await
-        .context("Image generation failed")?;
-
-        return Ok(());
+        return run_image_mode(&cli, &config, parsed_input, model_override).await;
     }
 
     // Resolve tool mode from CLI
