@@ -18,6 +18,8 @@ use openrouter_rs::types::{Role, ToolCall};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::io::{self, IsTerminal};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::InlineColors;
 use crate::file_ops::FileWriter;
@@ -36,6 +38,8 @@ use crate::tools::{
 pub struct Session {
     /// Conversation history (system, user, assistant, tool messages)
     messages: Vec<Message>,
+    /// Stable session identifier reused across all requests in this session
+    session_id: String,
     /// The model being used
     model_entry: ModelEntry,
     /// API client
@@ -125,6 +129,7 @@ impl Session {
     ) -> Self {
         Session {
             messages: Vec::new(),
+            session_id: generate_session_id(),
             model_entry,
             client,
             output_files,
@@ -265,6 +270,7 @@ impl Session {
         builder
             .model(&self.model_entry.model_id)
             .messages(self.messages.clone())
+            .session_id(&self.session_id)
             .temperature(0.5);
 
         if availability.read_tools {
@@ -611,6 +617,18 @@ impl Session {
     }
 }
 
+fn generate_session_id() -> String {
+    static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+    let counter = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+    let timestamp_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+
+    format!("zo-{:x}-{:x}-{:x}", std::process::id(), timestamp_nanos, counter)
+}
+
 fn truncate_with_suffix(input: &str, max_chars: usize) -> String {
     let total = input.chars().count();
     if total <= max_chars {
@@ -675,6 +693,30 @@ pub fn build_user_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openrouter_rs::OpenRouterClient;
+
+    fn test_session() -> Session {
+        Session::new(
+            OpenRouterClient::builder().build().unwrap(),
+            ModelEntry {
+                model_id: "openai/gpt-5.4".to_string(),
+                system_prompt: None,
+            },
+            vec![],
+            false,
+            "base16-ocean.dark".to_string(),
+            InlineColors::default(),
+            ToolAccess {
+                file_mode: FileToolMode::Disabled,
+                shell_enabled: false,
+            },
+            None,
+            false,
+            false,
+            false,
+            false,
+        )
+    }
 
     #[test]
     fn test_build_user_message_simple() {
@@ -815,5 +857,31 @@ mod tests {
         assert_eq!(truncated["long"], "abcd...(+22 chars)");
         assert_eq!(truncated["nested"]["array"][0], "1234...(+6 chars)");
         assert_eq!(truncated["nested"]["array"][1], "ok");
+    }
+
+    #[test]
+    fn test_build_request_includes_session_id() {
+        let session = test_session();
+
+        let request = session.build_request().unwrap();
+        let json = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(json["session_id"], session.session_id);
+        assert!(session.session_id.starts_with("zo-"));
+    }
+
+    #[test]
+    fn test_build_request_reuses_same_session_id() {
+        let mut session = test_session();
+        session.messages.push(Message::new(Role::User, "first"));
+
+        let first_request = session.build_request().unwrap();
+        let second_request = session.build_request().unwrap();
+
+        let first_json = serde_json::to_value(&first_request).unwrap();
+        let second_json = serde_json::to_value(&second_request).unwrap();
+
+        assert_eq!(first_json["session_id"], second_json["session_id"]);
+        assert_eq!(first_json["session_id"], session.session_id);
     }
 }
