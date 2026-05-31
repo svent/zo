@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use crossterm::ExecutableCommand;
 use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
-use similar::{ChangeTag, TextDiff};
+use similar::{ChangeTag, DiffOp, TextDiff};
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -9,12 +9,15 @@ use std::path::{Path, PathBuf};
 use crate::config::InlineColors;
 use crate::tools::{enforce_tool_path_policy, resolve_workspace_path};
 
+const DIFF_CONTEXT_RADIUS: usize = 3;
+
 /// Handles file writing with security checks and user approval
 pub struct FileWriter {
     allowed_files: Vec<String>,
     allow_all_within_workspace: bool,
     allow_hidden: bool,
-    auto_approve: bool,
+    accept_writes: bool,
+    non_interactive: bool,
     inline_colors: InlineColors,
 }
 
@@ -30,20 +33,38 @@ struct DiffStats {
     removed_lines: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenderedDiff {
+    lines: Vec<RenderedDiffLine>,
+    stats: DiffStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RenderedDiffLine {
+    HunkHeader(String),
+    Change {
+        tag: ChangeTag,
+        text: String,
+        missing_newline: bool,
+    },
+}
+
 impl FileWriter {
     /// Create a new FileWriter with allowed files list
     pub fn new(
         allowed_files: Vec<String>,
         allow_all_within_workspace: bool,
         allow_hidden: bool,
-        auto_approve: bool,
+        accept_writes: bool,
+        non_interactive: bool,
         inline_colors: InlineColors,
     ) -> Self {
         Self {
             allowed_files,
             allow_all_within_workspace,
             allow_hidden,
-            auto_approve,
+            accept_writes,
+            non_interactive,
             inline_colors,
         }
     }
@@ -175,12 +196,14 @@ impl FileWriter {
         println!("\n📝 Changes to {}:", path.display());
         let diff_stats = self.show_diff(&old_content, new_content)?;
 
-        let approved = if self.auto_approve {
+        let approved = if self.accept_writes {
             println!(
-                "✓ Auto-approved (--yes flag, +{} / -{} lines)\n",
+                "✓ Auto-approved (--accept-writes flag, +{} / -{} lines)\n",
                 diff_stats.added_lines, diff_stats.removed_lines
             );
             true
+        } else if self.non_interactive {
+            false
         } else {
             self.ask_approval(diff_stats)?
         };
@@ -201,7 +224,14 @@ impl FileWriter {
 
             Ok(true)
         } else {
-            println!("✗ Skipped: {}\n", path.display());
+            if self.non_interactive {
+                println!(
+                    "✗ Skipped (--non-interactive denied overwrite): {}\n",
+                    path.display()
+                );
+            } else {
+                println!("✗ Skipped: {}\n", path.display());
+            }
             Ok(false)
         }
     }
@@ -209,30 +239,51 @@ impl FileWriter {
     /// Display colored diff between old and new content
     fn show_diff(&self, old: &str, new: &str) -> Result<DiffStats> {
         let mut stdout = io::stdout();
-        let mut stats = DiffStats::default();
+        let rendered = render_diff(old, new);
 
-        let diff = TextDiff::from_lines(old, new);
-
-        for change in diff.iter_all_changes() {
-            let (sign, color) = match change.tag() {
-                ChangeTag::Delete => {
-                    stats.removed_lines += 1;
-                    ("-", Color::Red)
+        for line in &rendered.lines {
+            match line {
+                RenderedDiffLine::HunkHeader(header) => {
+                    stdout
+                        .execute(SetForegroundColor(Color::DarkGrey))?
+                        .execute(SetAttribute(Attribute::Dim))?
+                        .execute(Print(header))?
+                        .execute(Print("\n"))?
+                        .execute(ResetColor)?
+                        .execute(SetAttribute(Attribute::Reset))?;
                 }
-                ChangeTag::Insert => {
-                    stats.added_lines += 1;
-                    ("+", Color::Green)
-                }
-                ChangeTag::Equal => (" ", Color::Reset),
-            };
+                RenderedDiffLine::Change {
+                    tag,
+                    text,
+                    missing_newline,
+                } => {
+                    let color = match tag {
+                        ChangeTag::Delete => Color::Red,
+                        ChangeTag::Insert => Color::Green,
+                        ChangeTag::Equal => Color::Reset,
+                    };
 
-            stdout.execute(SetForegroundColor(color))?;
-            stdout.execute(Print(format!("{}{}", sign, change)))?;
-            stdout.execute(ResetColor)?;
+                    stdout
+                        .execute(SetForegroundColor(color))?
+                        .execute(Print(format!("{}{}", tag, text)))?;
+
+                    if *missing_newline {
+                        stdout
+                            .execute(Print("\n"))?
+                            .execute(SetForegroundColor(Color::DarkGrey))?
+                            .execute(SetAttribute(Attribute::Dim))?
+                            .execute(Print("\\ No newline at end of file\n"))?
+                            .execute(SetForegroundColor(color))?
+                            .execute(SetAttribute(Attribute::Reset))?;
+                    }
+
+                    stdout.execute(ResetColor)?;
+                }
+            }
         }
 
         stdout.flush()?;
-        Ok(stats)
+        Ok(rendered.stats)
     }
 
     /// Ask user for approval
@@ -242,15 +293,13 @@ impl FileWriter {
             .execute(SetForegroundColor(self.inline_colors.get_prompt_color()))?
             .execute(SetAttribute(Attribute::Bold))?
             .execute(Print(format!(
-                "Apply changes? [y/N] (+{}/-{} lines): ",
+                "Apply changes? [Y/n] (+{}/-{} lines): ",
                 diff_stats.added_lines, diff_stats.removed_lines
             )))?
             .execute(ResetColor)?;
         stdout.flush()?;
 
-        Ok(read_confirmation_response()?
-            .trim()
-            .eq_ignore_ascii_case("y"))
+        Ok(is_confirmation_approved(&read_confirmation_response()?))
     }
 }
 
@@ -271,6 +320,13 @@ fn read_confirmation_response() -> Result<String> {
     Ok(response)
 }
 
+fn is_confirmation_approved(response: &str) -> bool {
+    let response = response.trim();
+    response.is_empty()
+        || response.eq_ignore_ascii_case("y")
+        || response.eq_ignore_ascii_case("yes")
+}
+
 fn resolve_binary_output_path(path: &str, allow_hidden: bool) -> Result<PathBuf> {
     let resolved = resolve_workspace_path(path, true)?;
     enforce_tool_path_policy(&resolved, path, allow_hidden)?;
@@ -285,18 +341,19 @@ pub fn write_binary_file(
     path: &str,
     content: &[u8],
     allow_hidden: bool,
-    auto_approve: bool,
+    accept_writes: bool,
+    non_interactive: bool,
 ) -> Result<bool> {
     let resolved = resolve_binary_output_path(path, allow_hidden)?;
 
-    if resolved.exists() && !auto_approve {
-        print!("Overwrite existing file? [y/N]: ");
+    if resolved.exists() && !accept_writes {
+        if non_interactive {
+            return Ok(false);
+        }
+        print!("Overwrite existing file? [Y/n]: ");
         io::stdout().flush()?;
 
-        if !read_confirmation_response()?
-            .trim()
-            .eq_ignore_ascii_case("y")
-        {
+        if !is_confirmation_approved(&read_confirmation_response()?) {
             return Ok(false);
         }
     }
@@ -342,6 +399,65 @@ fn split_replacement_lines(new_content: &str) -> Vec<String> {
     lines
 }
 
+fn render_diff(old: &str, new: &str) -> RenderedDiff {
+    let diff = TextDiff::from_lines(old, new);
+    let mut lines = Vec::new();
+    let mut stats = DiffStats::default();
+
+    for ops in diff.grouped_ops(DIFF_CONTEXT_RADIUS) {
+        if ops.is_empty() {
+            continue;
+        }
+
+        lines.push(RenderedDiffLine::HunkHeader(format_hunk_header(&ops)));
+
+        for op in &ops {
+            for change in diff.iter_changes(op) {
+                match change.tag() {
+                    ChangeTag::Delete => stats.removed_lines += 1,
+                    ChangeTag::Insert => stats.added_lines += 1,
+                    ChangeTag::Equal => {}
+                }
+
+                lines.push(RenderedDiffLine::Change {
+                    tag: change.tag(),
+                    text: change.to_string_lossy().into_owned(),
+                    missing_newline: change.missing_newline(),
+                });
+            }
+        }
+    }
+
+    RenderedDiff { lines, stats }
+}
+
+fn format_hunk_header(ops: &[DiffOp]) -> String {
+    let first = ops[0];
+    let last = ops[ops.len() - 1];
+    let old_range = first.old_range().start..last.old_range().end;
+    let new_range = first.new_range().start..last.new_range().end;
+
+    format!(
+        "@@ -{} +{} @@",
+        format_hunk_range(old_range.start, old_range.end),
+        format_hunk_range(new_range.start, new_range.end)
+    )
+}
+
+fn format_hunk_range(start: usize, end: usize) -> String {
+    let len = end.saturating_sub(start);
+    let mut beginning = start + 1;
+
+    if len == 1 {
+        beginning.to_string()
+    } else {
+        if len == 0 {
+            beginning -= 1;
+        }
+        format!("{},{}", beginning, len)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,7 +472,7 @@ mod tests {
             .to_string_lossy()
             .to_string();
         let inline_colors = InlineColors::default();
-        let writer = FileWriter::new(vec![normalized], false, false, true, inline_colors);
+        let writer = FileWriter::new(vec![normalized], false, false, true, false, inline_colors);
 
         let result = writer.write_file(temp_file, "test content");
         assert!(result.is_ok());
@@ -372,7 +488,7 @@ mod tests {
     #[test]
     fn test_file_writer_rejects_unallowed() {
         let inline_colors = InlineColors::default();
-        let writer = FileWriter::new(vec![], false, false, true, inline_colors);
+        let writer = FileWriter::new(vec![], false, false, true, false, inline_colors);
         let result = writer.write_file("forbidden.txt", "content");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("allowed list"));
@@ -389,7 +505,7 @@ mod tests {
             .to_string_lossy()
             .to_string();
         let inline_colors = InlineColors::default();
-        let writer = FileWriter::new(vec![normalized], false, false, true, inline_colors);
+        let writer = FileWriter::new(vec![normalized], false, false, true, false, inline_colors);
 
         let result = writer.write_file(temp_file, "new content");
         assert!(result.is_ok());
@@ -399,6 +515,17 @@ mod tests {
         assert_eq!(content, "new content");
 
         fs::remove_file(temp_file).ok();
+    }
+
+    #[test]
+    fn test_confirmation_defaults_to_yes() {
+        assert!(is_confirmation_approved(""));
+        assert!(is_confirmation_approved("y"));
+        assert!(is_confirmation_approved("yes"));
+        assert!(is_confirmation_approved(" Y "));
+        assert!(!is_confirmation_approved("n"));
+        assert!(!is_confirmation_approved("no"));
+        assert!(!is_confirmation_approved("anything else"));
     }
 
     #[test]
@@ -415,6 +542,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             InlineColors::default(),
         );
 
@@ -441,6 +569,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             InlineColors::default(),
         );
 
@@ -465,6 +594,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             InlineColors::default(),
         );
 
@@ -491,6 +621,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             InlineColors::default(),
         );
 
@@ -506,7 +637,7 @@ mod tests {
         let temp_file = "test_allow_all_workspace.txt";
         let _ = fs::remove_file(temp_file);
 
-        let writer = FileWriter::new(vec![], true, false, true, InlineColors::default());
+        let writer = FileWriter::new(vec![], true, false, true, false, InlineColors::default());
         let result = writer.write_file(temp_file, "workspace write");
 
         assert!(result.unwrap());
@@ -521,12 +652,14 @@ mod tests {
         let hidden_file = ".test_file_writer_hidden.txt";
         let _ = fs::remove_file(hidden_file);
 
-        let blocked_writer = FileWriter::new(vec![], true, false, true, InlineColors::default());
+        let blocked_writer =
+            FileWriter::new(vec![], true, false, true, false, InlineColors::default());
         let blocked = blocked_writer.write_file(hidden_file, "hidden content");
         assert!(blocked.is_err());
         assert!(blocked.unwrap_err().to_string().contains("--hidden"));
 
-        let allowed_writer = FileWriter::new(vec![], true, true, true, InlineColors::default());
+        let allowed_writer =
+            FileWriter::new(vec![], true, true, true, false, InlineColors::default());
         let allowed = allowed_writer.write_file(hidden_file, "hidden content");
         assert!(allowed.unwrap());
 
@@ -538,7 +671,7 @@ mod tests {
         let temp_file = "test_binary_output_new.png";
         let _ = fs::remove_file(temp_file);
 
-        let result = write_binary_file(temp_file, &[0x89, 0x50, 0x4e, 0x47], false, true);
+        let result = write_binary_file(temp_file, &[0x89, 0x50, 0x4e, 0x47], false, true, false);
         assert!(result.unwrap());
 
         let bytes = fs::read(temp_file).unwrap();
@@ -552,7 +685,7 @@ mod tests {
         let temp_file = "test_binary_output_overwrite.jpg";
         fs::write(temp_file, [0xff, 0xd8, 0xff]).unwrap();
 
-        let result = write_binary_file(temp_file, &[0x89, 0x50, 0x4e, 0x47], false, true);
+        let result = write_binary_file(temp_file, &[0x89, 0x50, 0x4e, 0x47], false, true, false);
         assert!(result.unwrap());
 
         let bytes = fs::read(temp_file).unwrap();
@@ -562,15 +695,55 @@ mod tests {
     }
 
     #[test]
+    fn test_file_writer_non_interactive_denies_overwrite() {
+        let temp_file = "test_file_writer_non_interactive.txt";
+        fs::write(temp_file, "old content\n").unwrap();
+
+        let normalized = resolve_workspace_path(temp_file, false)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let writer = FileWriter::new(
+            vec![normalized],
+            false,
+            false,
+            false,
+            true,
+            InlineColors::default(),
+        );
+
+        let result = writer.write_file(temp_file, "new content").unwrap();
+        assert!(!result);
+        let content = fs::read_to_string(temp_file).unwrap();
+        assert_eq!(content, "old content\n");
+
+        fs::remove_file(temp_file).ok();
+    }
+
+    #[test]
+    fn test_write_binary_file_non_interactive_denies_overwrite() {
+        let temp_file = "test_binary_output_non_interactive.jpg";
+        fs::write(temp_file, [0xff, 0xd8, 0xff]).unwrap();
+
+        let result = write_binary_file(temp_file, &[0x89, 0x50, 0x4e, 0x47], false, false, true);
+        assert!(!result.unwrap());
+
+        let bytes = fs::read(temp_file).unwrap();
+        assert_eq!(bytes, vec![0xff, 0xd8, 0xff]);
+
+        fs::remove_file(temp_file).ok();
+    }
+
+    #[test]
     fn test_write_binary_file_blocks_hidden_path_by_default() {
         let hidden_file = ".test_binary_hidden.png";
         let _ = fs::remove_file(hidden_file);
 
-        let blocked = write_binary_file(hidden_file, &[1, 2, 3], false, true);
+        let blocked = write_binary_file(hidden_file, &[1, 2, 3], false, true, false);
         assert!(blocked.is_err());
         assert!(blocked.unwrap_err().to_string().contains("--hidden"));
 
-        let allowed = write_binary_file(hidden_file, &[1, 2, 3], true, true);
+        let allowed = write_binary_file(hidden_file, &[1, 2, 3], true, true, false);
         assert!(allowed.unwrap());
 
         fs::remove_file(hidden_file).ok();
@@ -578,7 +751,7 @@ mod tests {
 
     #[test]
     fn test_write_binary_file_enforces_workspace() {
-        let result = write_binary_file("../outside-workspace.png", &[1, 2, 3], false, true);
+        let result = write_binary_file("../outside-workspace.png", &[1, 2, 3], false, true, false);
         assert!(result.is_err());
         assert!(
             result
@@ -611,6 +784,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             InlineColors::default(),
         );
 
@@ -631,7 +805,7 @@ mod tests {
 
     #[test]
     fn test_show_diff_returns_line_counts() {
-        let writer = FileWriter::new(vec![], true, false, true, InlineColors::default());
+        let writer = FileWriter::new(vec![], true, false, true, false, InlineColors::default());
 
         let stats = writer.show_diff("a\nb\nc\n", "a\nx\nc\nd\n").unwrap();
         assert_eq!(
@@ -641,5 +815,122 @@ mod tests {
                 removed_lines: 1,
             }
         );
+    }
+
+    #[test]
+    fn test_render_diff_limits_context_for_small_change_in_large_file() {
+        let old = (1..=12)
+            .map(|i| format!("line {i}\n"))
+            .collect::<Vec<_>>()
+            .join("");
+        let new = old.replace("line 6\n", "updated 6\n");
+
+        let rendered = render_diff(&old, &new);
+
+        assert_eq!(rendered.stats.added_lines, 1);
+        assert_eq!(rendered.stats.removed_lines, 1);
+        assert_eq!(
+            rendered.lines[0],
+            RenderedDiffLine::HunkHeader("@@ -3,7 +3,7 @@".to_string())
+        );
+        assert!(rendered.lines.iter().any(|line| matches!(
+            line,
+            RenderedDiffLine::Change {
+                tag: ChangeTag::Equal,
+                text,
+                ..
+            } if text == "line 3\n"
+        )));
+        assert!(rendered.lines.iter().any(|line| matches!(
+            line,
+            RenderedDiffLine::Change {
+                tag: ChangeTag::Equal,
+                text,
+                ..
+            } if text == "line 9\n"
+        )));
+        assert!(!rendered.lines.iter().any(|line| matches!(
+            line,
+            RenderedDiffLine::Change {
+                text,
+                ..
+            } if text == "line 1\n" || text == "line 12\n"
+        )));
+    }
+
+    #[test]
+    fn test_render_diff_splits_far_apart_changes_into_multiple_hunks() {
+        let old = (1..=14)
+            .map(|i| format!("line {i}\n"))
+            .collect::<Vec<_>>()
+            .join("");
+        let new = old
+            .replace("line 2\n", "updated 2\n")
+            .replace("line 13\n", "updated 13\n");
+
+        let rendered = render_diff(&old, &new);
+
+        assert_eq!(
+            rendered
+                .lines
+                .iter()
+                .filter(|line| matches!(line, RenderedDiffLine::HunkHeader(_)))
+                .count(),
+            2
+        );
+        assert!(rendered.lines.iter().any(|line| matches!(
+            line,
+            RenderedDiffLine::HunkHeader(text) if text == "@@ -1,5 +1,5 @@"
+        )));
+        assert!(rendered.lines.iter().any(|line| matches!(
+            line,
+            RenderedDiffLine::HunkHeader(text) if text == "@@ -10,5 +10,5 @@"
+        )));
+    }
+
+    #[test]
+    fn test_render_diff_merges_nearby_changes_into_single_hunk() {
+        let old = (1..=12)
+            .map(|i| format!("line {i}\n"))
+            .collect::<Vec<_>>()
+            .join("");
+        let new = old
+            .replace("line 5\n", "updated 5\n")
+            .replace("line 8\n", "updated 8\n");
+
+        let rendered = render_diff(&old, &new);
+
+        let headers = rendered
+            .lines
+            .iter()
+            .filter_map(|line| match line {
+                RenderedDiffLine::HunkHeader(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(headers, vec!["@@ -2,10 +2,10 @@"],);
+    }
+
+    #[test]
+    fn test_render_diff_preserves_missing_newline_hint() {
+        let rendered = render_diff("line 1\nline 2\n", "line 1\nline 2");
+
+        assert!(rendered.lines.iter().any(|line| matches!(
+            line,
+            RenderedDiffLine::Change {
+                tag: ChangeTag::Delete,
+                text,
+                missing_newline: false,
+            } if text == "line 2\n"
+        )));
+        assert!(rendered.lines.iter().any(|line| matches!(
+            line,
+            RenderedDiffLine::Change {
+                tag: ChangeTag::Insert,
+                text,
+                missing_newline: true,
+            } if text == "line 2"
+        )));
     }
 }

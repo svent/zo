@@ -1653,9 +1653,9 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "openrouter-rs"
-version = "0.5.0"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cce1f34085abbf83c2db737679482fcd6a3b3fb6f469bd1cad9982b7a3b56469"
+checksum = "1b4c290524fe15f5f76046d1e771fa8868f76d70956bad6eb08d09ddb95dccb0"
 dependencies = [
  "anyhow",
  "derive_builder",
@@ -3381,6 +3381,7 @@ name = "zo-cli"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
  "crossterm",
  "dirs",
@@ -3389,6 +3390,7 @@ dependencies = [
  "glob",
  "grep",
  "ignore",
+ "libc",
  "openrouter-rs",
  "openssl",
  "pulldown-cmark",

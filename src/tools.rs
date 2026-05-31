@@ -19,24 +19,35 @@ const MAX_READ_FILE_LINES: usize = 400;
 const MAX_READ_FILE_CHARS: usize = 24_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum ToolsCliMode {
-    Ro,
-    Rw,
+pub enum FileCliAccess {
+    Read,
+    Write,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolMode {
+pub enum FileToolMode {
     Disabled,
     ReadOnly,
     ReadWrite,
 }
 
-impl From<Option<ToolsCliMode>> for ToolMode {
-    fn from(value: Option<ToolsCliMode>) -> Self {
-        match value {
-            None => ToolMode::Disabled,
-            Some(ToolsCliMode::Ro) => ToolMode::ReadOnly,
-            Some(ToolsCliMode::Rw) => ToolMode::ReadWrite,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolAccess {
+    pub file_mode: FileToolMode,
+    pub shell_enabled: bool,
+}
+
+impl ToolAccess {
+    pub fn from_cli(files: Option<FileCliAccess>, shell_enabled: bool) -> Self {
+        let file_mode = match files {
+            Some(FileCliAccess::Read) => FileToolMode::ReadOnly,
+            Some(FileCliAccess::Write) => FileToolMode::ReadWrite,
+            None => FileToolMode::Disabled,
+        };
+
+        Self {
+            file_mode,
+            shell_enabled,
         }
     }
 }
@@ -665,6 +676,27 @@ mod tests {
     fn assert_unknown_field_rejected<T: DeserializeOwned>(value: serde_json::Value) {
         let result = serde_json::from_value::<T>(value);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_tool_access_maps_read_and_shell() {
+        let access = ToolAccess::from_cli(Some(FileCliAccess::Read), true);
+        assert_eq!(access.file_mode, FileToolMode::ReadOnly);
+        assert!(access.shell_enabled);
+    }
+
+    #[test]
+    fn test_tool_access_maps_write_without_shell() {
+        let access = ToolAccess::from_cli(Some(FileCliAccess::Write), false);
+        assert_eq!(access.file_mode, FileToolMode::ReadWrite);
+        assert!(!access.shell_enabled);
+    }
+
+    #[test]
+    fn test_tool_access_maps_disabled_when_files_absent() {
+        let access = ToolAccess::from_cli(None, false);
+        assert_eq!(access.file_mode, FileToolMode::Disabled);
+        assert!(!access.shell_enabled);
     }
 
     #[test]

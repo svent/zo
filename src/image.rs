@@ -15,8 +15,9 @@ pub const DEFAULT_IMAGE_MODEL_ID: &str = "google/gemini-2.5-flash-image";
 
 pub struct ImageGenerationOptions {
     pub output_path: String,
-    pub auto_approve: bool,
+    pub accept_writes: bool,
     pub allow_hidden: bool,
+    pub non_interactive: bool,
 }
 
 pub async fn derive_image_modalities(
@@ -70,7 +71,8 @@ pub async fn run_image_generation(
         &options.output_path,
         &image_bytes,
         options.allow_hidden,
-        options.auto_approve,
+        options.accept_writes,
+        options.non_interactive,
     )? {
         println!("Cancelled.");
         return Ok(());
@@ -298,11 +300,7 @@ mod tests {
         let response = response_with_images(json!([]));
         let error = extract_generated_image_data_url(&response).unwrap_err();
 
-        assert!(
-            error
-                .to_string()
-                .contains("did not include any images")
-        );
+        assert!(error.to_string().contains("did not include any images"));
     }
 
     #[test]

@@ -16,6 +16,7 @@ use openrouter_rs::types::stream::StreamEvent;
 use openrouter_rs::types::typed_tool::TypedTool;
 use openrouter_rs::types::{Role, ToolCall};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::io::{self, IsTerminal};
 
 use crate::config::InlineColors;
@@ -23,11 +24,12 @@ use crate::file_ops::FileWriter;
 use crate::input::{FileReference, OutputFileSpec};
 use crate::models::ModelEntry;
 use crate::render::StreamRenderer;
+use crate::shell::{RunProgramParams, RunShellCommandParams, ShellRuntime};
 use crate::system_prompt;
 use crate::tools::{
-    EditFileParams, FindParams, GrepExactParams, GrepRegexParams, ListFilesParams, ReadFileParams,
-    ReplaceLinesParams, ToolMode, WriteFileParams, clamp_tool_output, run_find, run_grep_exact,
-    run_grep_regex, run_list_files, run_read_file,
+    EditFileParams, FileToolMode, FindParams, GrepExactParams, GrepRegexParams, ListFilesParams,
+    ReadFileParams, ReplaceLinesParams, ToolAccess, WriteFileParams, clamp_tool_output, run_find,
+    run_grep_exact, run_grep_regex, run_list_files, run_read_file,
 };
 
 /// A unified session for interacting with language models
@@ -40,20 +42,26 @@ pub struct Session {
     client: OpenRouterClient,
     /// Files allowed for writing (accumulates in chat mode)
     output_files: Vec<OutputFileSpec>,
-    /// Whether to auto-approve file changes
-    auto_approve: bool,
+    /// Whether to auto-approve file overwrites and edits
+    accept_writes: bool,
     /// Theme for markdown rendering
     theme_name: String,
     /// Colors for inline markdown
     inline_colors: InlineColors,
-    /// Tool access mode
-    tool_mode: ToolMode,
+    /// Tool access capabilities
+    tool_access: ToolAccess,
+    /// Optional shell runtime when shell tools are enabled
+    shell_runtime: Option<ShellRuntime>,
+    /// Whether confirmation prompts should be suppressed
+    non_interactive: bool,
     /// Whether hidden files/directories are accessible to tools
     allow_hidden: bool,
     /// Whether to print tool calls requested by the model before executing them
     show_tool_calls: bool,
     /// Whether to show full tool arguments in logs (for debug mode)
     show_full_tool_args: bool,
+    /// Commands denied or rejected earlier in the session
+    failed_shell_calls: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,27 +69,31 @@ struct ToolAvailability {
     read_tools: bool,
     write_file: bool,
     edit_tools: bool,
+    shell_tools: bool,
 }
 
 fn determine_tool_availability(
-    tool_mode: ToolMode,
+    tool_access: ToolAccess,
     output_files: &[OutputFileSpec],
 ) -> ToolAvailability {
-    match tool_mode {
-        ToolMode::Disabled => ToolAvailability {
+    match tool_access.file_mode {
+        FileToolMode::Disabled => ToolAvailability {
             read_tools: false,
             write_file: !output_files.is_empty(),
             edit_tools: false,
+            shell_tools: tool_access.shell_enabled,
         },
-        ToolMode::ReadOnly => ToolAvailability {
+        FileToolMode::ReadOnly => ToolAvailability {
             read_tools: true,
             write_file: !output_files.is_empty(),
             edit_tools: output_files.iter().any(|f| f.include_as_input),
+            shell_tools: tool_access.shell_enabled,
         },
-        ToolMode::ReadWrite => ToolAvailability {
+        FileToolMode::ReadWrite => ToolAvailability {
             read_tools: true,
             write_file: true,
             edit_tools: true,
+            shell_tools: tool_access.shell_enabled,
         },
     }
 }
@@ -101,10 +113,12 @@ impl Session {
         client: OpenRouterClient,
         model_entry: ModelEntry,
         output_files: Vec<OutputFileSpec>,
-        auto_approve: bool,
+        accept_writes: bool,
         theme_name: String,
         inline_colors: InlineColors,
-        tool_mode: ToolMode,
+        tool_access: ToolAccess,
+        shell_runtime: Option<ShellRuntime>,
+        non_interactive: bool,
         allow_hidden: bool,
         show_tool_calls: bool,
         show_full_tool_args: bool,
@@ -114,13 +128,16 @@ impl Session {
             model_entry,
             client,
             output_files,
-            auto_approve,
+            accept_writes,
             theme_name,
             inline_colors,
-            tool_mode,
+            tool_access,
+            shell_runtime,
+            non_interactive,
             allow_hidden,
             show_tool_calls,
             show_full_tool_args,
+            failed_shell_calls: HashSet::new(),
         }
     }
 
@@ -216,13 +233,13 @@ impl Session {
         system_prompt::build_system_prompt(
             &self.model_entry,
             &self.output_files,
-            self.tool_mode,
+            self.tool_access,
             self.allow_hidden,
         )
     }
 
     fn tool_availability(&self) -> ToolAvailability {
-        determine_tool_availability(self.tool_mode, &self.output_files)
+        determine_tool_availability(self.tool_access, &self.output_files)
     }
 
     fn output_write_paths(&self) -> Vec<String> {
@@ -265,6 +282,11 @@ impl Session {
         if availability.edit_tools {
             builder.tool(EditFileParams::create_tool());
             builder.tool(ReplaceLinesParams::create_tool());
+        }
+
+        if availability.shell_tools {
+            builder.tool(RunProgramParams::create_tool());
+            builder.tool(RunShellCommandParams::create_tool());
         }
 
         builder
@@ -365,25 +387,28 @@ impl Session {
 
         let write_writer = FileWriter::new(
             self.output_write_paths(),
-            matches!(self.tool_mode, ToolMode::ReadWrite),
+            self.tool_access.file_mode == FileToolMode::ReadWrite,
             self.allow_hidden,
-            self.auto_approve,
+            self.accept_writes,
+            self.non_interactive,
             self.inline_colors.clone(),
         );
 
         let edit_writer = FileWriter::new(
             self.output_edit_paths(),
-            matches!(self.tool_mode, ToolMode::ReadWrite),
+            self.tool_access.file_mode == FileToolMode::ReadWrite,
             self.allow_hidden,
-            self.auto_approve,
+            self.accept_writes,
+            self.non_interactive,
             self.inline_colors.clone(),
         );
 
         for tool_call in tool_calls {
             self.log_tool_call(tool_call);
 
-            let tool_result =
-                self.execute_single_tool_call(tool_call, availability, &write_writer, &edit_writer);
+            let tool_result = self
+                .execute_single_tool_call(tool_call, availability, &write_writer, &edit_writer)
+                .await;
 
             let result_text = match tool_result {
                 Ok(text) => text,
@@ -440,8 +465,8 @@ impl Session {
         eprintln!("[tool] {} args={}", tool_call.name(), one_line_args);
     }
 
-    fn execute_single_tool_call(
-        &self,
+    async fn execute_single_tool_call(
+        &mut self,
         tool_call: &ToolCall,
         availability: ToolAvailability,
         write_writer: &FileWriter,
@@ -507,7 +532,7 @@ impl Session {
                     .context("Invalid write_file parameters")?;
                 match write_writer.write_file(&params.path, &params.content)? {
                     true => Ok(format!("Successfully wrote file: {}", params.path)),
-                    false => Ok(format!("User declined changes to: {}", params.path)),
+                    false => Ok(format!("Skipped changes to: {}", params.path)),
                 }
             }
             "edit_file" => {
@@ -519,7 +544,7 @@ impl Session {
                     .context("Invalid edit_file parameters")?;
                 match edit_writer.edit_file(&params.path, &params.old_string, &params.new_string)? {
                     true => Ok(format!("Successfully edited file: {}", params.path)),
-                    false => Ok(format!("User declined changes to: {}", params.path)),
+                    false => Ok(format!("Skipped changes to: {}", params.path)),
                 }
             }
             "replace_lines" => {
@@ -536,8 +561,50 @@ impl Session {
                     &params.new_content,
                 )? {
                     true => Ok(format!("Successfully replaced lines in: {}", params.path)),
-                    false => Ok(format!("User declined changes to: {}", params.path)),
+                    false => Ok(format!("Skipped changes to: {}", params.path)),
                 }
+            }
+            "run_program" => {
+                if !availability.shell_tools {
+                    return Ok("Tool 'run_program' is not available in current mode.".to_string());
+                }
+                let params = tool_call
+                    .parse_params::<RunProgramParams>()
+                    .context("Invalid run_program parameters")?;
+                let runtime = self
+                    .shell_runtime
+                    .clone()
+                    .context("Shell runtime is unavailable")?;
+                runtime
+                    .execute_program(
+                        params,
+                        self.allow_hidden,
+                        &self.inline_colors,
+                        &mut self.failed_shell_calls,
+                    )
+                    .await
+            }
+            "run_shell_command" => {
+                if !availability.shell_tools {
+                    return Ok(
+                        "Tool 'run_shell_command' is not available in current mode.".to_string()
+                    );
+                }
+                let params = tool_call
+                    .parse_params::<RunShellCommandParams>()
+                    .context("Invalid run_shell_command parameters")?;
+                let runtime = self
+                    .shell_runtime
+                    .clone()
+                    .context("Shell runtime is unavailable")?;
+                runtime
+                    .execute_shell_command(
+                        params,
+                        self.allow_hidden,
+                        &self.inline_colors,
+                        &mut self.failed_shell_calls,
+                    )
+                    .await
             }
             unknown => Ok(format!("Unknown tool: {}", unknown)),
         }
@@ -654,10 +721,17 @@ mod tests {
 
     #[test]
     fn test_tool_availability_disabled_no_outputs() {
-        let availability = determine_tool_availability(ToolMode::Disabled, &[]);
+        let availability = determine_tool_availability(
+            ToolAccess {
+                file_mode: FileToolMode::Disabled,
+                shell_enabled: false,
+            },
+            &[],
+        );
         assert!(!availability.read_tools);
         assert!(!availability.write_file);
         assert!(!availability.edit_tools);
+        assert!(!availability.shell_tools);
     }
 
     #[test]
@@ -667,7 +741,13 @@ mod tests {
             normalized_path: "/tmp/out.txt".to_string(),
             include_as_input: false,
         };
-        let availability = determine_tool_availability(ToolMode::Disabled, &[output]);
+        let availability = determine_tool_availability(
+            ToolAccess {
+                file_mode: FileToolMode::Disabled,
+                shell_enabled: false,
+            },
+            &[output],
+        );
         assert!(!availability.read_tools);
         assert!(availability.write_file);
         assert!(!availability.edit_tools);
@@ -680,7 +760,13 @@ mod tests {
             normalized_path: "/tmp/rw.txt".to_string(),
             include_as_input: true,
         };
-        let availability = determine_tool_availability(ToolMode::ReadOnly, &[output]);
+        let availability = determine_tool_availability(
+            ToolAccess {
+                file_mode: FileToolMode::ReadOnly,
+                shell_enabled: false,
+            },
+            &[output],
+        );
         assert!(availability.read_tools);
         assert!(availability.write_file);
         assert!(availability.edit_tools);
@@ -688,10 +774,17 @@ mod tests {
 
     #[test]
     fn test_tool_availability_read_write() {
-        let availability = determine_tool_availability(ToolMode::ReadWrite, &[]);
+        let availability = determine_tool_availability(
+            ToolAccess {
+                file_mode: FileToolMode::ReadWrite,
+                shell_enabled: true,
+            },
+            &[],
+        );
         assert!(availability.read_tools);
         assert!(availability.write_file);
         assert!(availability.edit_tools);
+        assert!(availability.shell_tools);
     }
 
     #[test]

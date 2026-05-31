@@ -1,12 +1,12 @@
 use crate::input::OutputFileSpec;
 use crate::models::ModelEntry;
-use crate::tools::ToolMode;
+use crate::tools::{FileToolMode, ToolAccess};
 
 /// Build the system prompt including tool and file access instructions.
 pub fn build_system_prompt(
     model_entry: &ModelEntry,
     output_files: &[OutputFileSpec],
-    tool_mode: ToolMode,
+    tool_access: ToolAccess,
     allow_hidden: bool,
 ) -> String {
     let mut system_prompt = model_entry.system_prompt.clone().unwrap_or_default();
@@ -22,8 +22,10 @@ pub fn build_system_prompt(
         .map(|f| f.filename.as_str())
         .collect();
 
-    let tool_instructions = match tool_mode {
-        ToolMode::Disabled => {
+    let mut instructions = Vec::new();
+
+    let file_instructions = match tool_access.file_mode {
+        FileToolMode::Disabled => {
             if output_files.is_empty() {
                 None
             } else {
@@ -45,7 +47,7 @@ pub fn build_system_prompt(
                 ))
             }
         }
-        ToolMode::ReadOnly => {
+        FileToolMode::ReadOnly => {
             let mut parts = vec![
                 "IMPORTANT: Tool mode is enabled in constrained mode.".to_string(),
                 "Read tools available: list_files(path), find(glob), grep_regex(pattern, path_glob), grep_exact(text, path_glob), read_file(path, start_line, end_line).".to_string(),
@@ -88,7 +90,7 @@ pub fn build_system_prompt(
 
             Some(parts.join("\n"))
         }
-        ToolMode::ReadWrite => {
+        FileToolMode::ReadWrite => {
             let mut parts = vec![
                 "IMPORTANT: Tool mode is enabled in read-write workspace mode.".to_string(),
                 "You may read and modify files within the current working directory using tools."
@@ -109,7 +111,31 @@ pub fn build_system_prompt(
         }
     };
 
-    if let Some(instructions) = tool_instructions {
+    if let Some(file_instructions) = file_instructions {
+        instructions.push(file_instructions);
+    }
+
+    if tool_access.shell_enabled {
+        let mut parts = vec![
+            "IMPORTANT: Shell execution is enabled.".to_string(),
+            "Available shell tools: run_program(program, args, cwd, timeout_ms, max_output) and run_shell_command(command, cwd, shell, timeout_ms, max_output).".to_string(),
+            "Prefer run_program. Use run_shell_command only when you truly need shell syntax like pipelines.".to_string(),
+            "Never wrap commands in 'bash -lc' manually; the host will choose the shell when needed.".to_string(),
+            "Do not assume shell access is read-only. Approved commands run with the user's normal permissions, including filesystem and network access.".to_string(),
+            "Commands inherit zo's current environment.".to_string(),
+            "Avoid interactive commands. Stdin is closed and no TTY is provided.".to_string(),
+        ];
+        if !allow_hidden {
+            parts.push(
+                "Explicit hidden-path touches require approval unless the user enables --hidden."
+                    .to_string(),
+            );
+        }
+        instructions.push(parts.join("\n"));
+    }
+
+    if !instructions.is_empty() {
+        let instructions = instructions.join("\n\n");
         if system_prompt.is_empty() {
             system_prompt = instructions;
         } else {
@@ -145,7 +171,10 @@ mod tests {
         let prompt = build_system_prompt(
             &model(),
             &[output("a.txt", false)],
-            ToolMode::Disabled,
+            ToolAccess {
+                file_mode: FileToolMode::Disabled,
+                shell_enabled: false,
+            },
             false,
         );
         assert!(prompt.contains("write_file"));
@@ -154,7 +183,15 @@ mod tests {
 
     #[test]
     fn test_read_only_mode_mentions_read_tools() {
-        let prompt = build_system_prompt(&model(), &[], ToolMode::ReadOnly, false);
+        let prompt = build_system_prompt(
+            &model(),
+            &[],
+            ToolAccess {
+                file_mode: FileToolMode::ReadOnly,
+                shell_enabled: false,
+            },
+            false,
+        );
         assert!(prompt.contains("list_files"));
         assert!(prompt.contains("No write permissions"));
     }
@@ -164,7 +201,10 @@ mod tests {
         let prompt = build_system_prompt(
             &model(),
             &[output("wo.txt", false), output("rw.txt", true)],
-            ToolMode::ReadOnly,
+            ToolAccess {
+                file_mode: FileToolMode::ReadOnly,
+                shell_enabled: false,
+            },
             false,
         );
         assert!(prompt.contains("Write-only files"));
@@ -175,19 +215,58 @@ mod tests {
 
     #[test]
     fn test_read_write_mode_mentions_full_tools() {
-        let prompt = build_system_prompt(&model(), &[], ToolMode::ReadWrite, false);
+        let prompt = build_system_prompt(
+            &model(),
+            &[],
+            ToolAccess {
+                file_mode: FileToolMode::ReadWrite,
+                shell_enabled: false,
+            },
+            false,
+        );
         assert!(prompt.contains("replace_lines"));
     }
 
     #[test]
     fn test_hidden_restriction_appears_when_disabled() {
-        let prompt = build_system_prompt(&model(), &[], ToolMode::ReadOnly, false);
+        let prompt = build_system_prompt(
+            &model(),
+            &[],
+            ToolAccess {
+                file_mode: FileToolMode::ReadOnly,
+                shell_enabled: false,
+            },
+            false,
+        );
         assert!(prompt.contains("--hidden"));
     }
 
     #[test]
     fn test_hidden_restriction_omitted_when_enabled() {
-        let prompt = build_system_prompt(&model(), &[], ToolMode::ReadOnly, true);
+        let prompt = build_system_prompt(
+            &model(),
+            &[],
+            ToolAccess {
+                file_mode: FileToolMode::ReadOnly,
+                shell_enabled: false,
+            },
+            true,
+        );
         assert!(!prompt.contains("--hidden"));
+    }
+
+    #[test]
+    fn test_shell_mode_mentions_shell_tools() {
+        let prompt = build_system_prompt(
+            &model(),
+            &[],
+            ToolAccess {
+                file_mode: FileToolMode::Disabled,
+                shell_enabled: true,
+            },
+            false,
+        );
+        assert!(prompt.contains("run_program"));
+        assert!(prompt.contains("normal permissions"));
     }
 }

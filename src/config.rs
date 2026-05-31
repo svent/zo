@@ -1,9 +1,11 @@
 use crate::models::{DEFAULT_MODELS, DEFAULT_TEXT_MODEL_NAME};
 use anyhow::{Context, Result};
 use crossterm::style::Color;
+use glob::Pattern;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Main configuration structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,7 +18,7 @@ pub struct Config {
     pub default_model: Option<String>,
 
     /// Model mappings (shortname -> OpenRouter model ID)
-    /// If specified, completely overrides the built-in model list
+    /// Adds new aliases, overrides built-in aliases, or disables built-in aliases with ""
     #[serde(default)]
     pub models: Option<std::collections::HashMap<String, String>>,
 
@@ -35,6 +37,10 @@ pub struct Config {
 
     /// Path to chat history file (enables history persistence when set)
     pub history_file: Option<String>,
+
+    /// Shell execution policies and defaults
+    #[serde(default)]
+    pub shell: ShellConfig,
 }
 
 /// Custom model definition
@@ -49,6 +55,83 @@ pub struct CustomModel {
 
     /// Optional system prompt for this model
     pub system_prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ShellPolicyAction {
+    Allow,
+    Ask,
+    Deny,
+}
+
+impl Default for ShellPolicyAction {
+    fn default() -> Self {
+        Self::Ask
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ShellArgMatcher {
+    pub exact: Option<String>,
+    pub glob: Option<String>,
+    pub regex: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ShellPolicyEntry {
+    pub action: ShellPolicyAction,
+    #[serde(default)]
+    pub terminal: bool,
+    pub program: Option<String>,
+    #[serde(default)]
+    pub args: Vec<ShellArgMatcher>,
+    #[serde(default)]
+    pub args_prefix: Vec<ShellArgMatcher>,
+    pub command_glob: Option<String>,
+    pub command_regex: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ShellPolicySet {
+    pub name: String,
+    #[serde(default)]
+    pub entries: Vec<ShellPolicyEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ShellConfig {
+    #[serde(default)]
+    pub default_action: ShellPolicyAction,
+    #[serde(default = "default_allowed_shells")]
+    pub allowed_shells: Vec<String>,
+    #[serde(default)]
+    pub always_on: Vec<ShellPolicyEntry>,
+    #[serde(default)]
+    pub policy_sets: Vec<ShellPolicySet>,
+}
+
+impl Default for ShellConfig {
+    fn default() -> Self {
+        Self {
+            default_action: ShellPolicyAction::Ask,
+            allowed_shells: default_allowed_shells(),
+            always_on: Vec::new(),
+            policy_sets: Vec::new(),
+        }
+    }
+}
+
+fn default_allowed_shells() -> Vec<String> {
+    vec![
+        "/bin/sh".to_string(),
+        "/bin/bash".to_string(),
+        "/bin/zsh".to_string(),
+    ]
 }
 
 /// Custom colors for inline markdown elements
@@ -158,6 +241,151 @@ impl InlineColors {
     }
 }
 
+fn validate_shell_arg_matcher(matcher: &ShellArgMatcher, context: &str) -> Result<()> {
+    let populated = matcher.exact.is_some() as u8
+        + matcher.glob.is_some() as u8
+        + matcher.regex.is_some() as u8;
+    if populated != 1 {
+        anyhow::bail!(
+            "{} must specify exactly one of 'exact', 'glob', or 'regex'",
+            context
+        );
+    }
+
+    if let Some(pattern) = &matcher.glob {
+        if pattern.is_empty() {
+            anyhow::bail!("{}.glob must not be empty", context);
+        }
+        Pattern::new(pattern)
+            .with_context(|| format!("{}.glob contains an invalid glob pattern", context))?;
+    }
+
+    if let Some(pattern) = &matcher.regex {
+        if pattern.is_empty() {
+            anyhow::bail!("{}.regex must not be empty", context);
+        }
+        Regex::new(pattern)
+            .with_context(|| format!("{}.regex contains an invalid regular expression", context))?;
+    }
+
+    Ok(())
+}
+
+fn validate_shell_policy_entry(entry: &ShellPolicyEntry, context: &str) -> Result<()> {
+    let matcher_count = entry.program.is_some() as u8
+        + entry.command_glob.is_some() as u8
+        + entry.command_regex.is_some() as u8;
+    if matcher_count != 1 {
+        anyhow::bail!(
+            "{} must specify exactly one matcher: 'program', 'command_glob', or 'command_regex'",
+            context
+        );
+    }
+
+    if let Some(program) = &entry.program {
+        if program.trim().is_empty() {
+            anyhow::bail!("{}.program must not be empty", context);
+        }
+        if entry.command_glob.is_some() || entry.command_regex.is_some() {
+            anyhow::bail!(
+                "{} cannot combine 'program' with 'command_glob' or 'command_regex'",
+                context
+            );
+        }
+        if !entry.args.is_empty() && !entry.args_prefix.is_empty() {
+            anyhow::bail!(
+                "{} cannot combine 'args' with 'args_prefix'; choose exact matching or prefix matching",
+                context
+            );
+        }
+        for (index, matcher) in entry.args.iter().enumerate() {
+            validate_shell_arg_matcher(matcher, &format!("{}.args[{}]", context, index))?;
+        }
+        for (index, matcher) in entry.args_prefix.iter().enumerate() {
+            validate_shell_arg_matcher(matcher, &format!("{}.args_prefix[{}]", context, index))?;
+        }
+    } else if !entry.args.is_empty() {
+        anyhow::bail!("{}.args requires a 'program' matcher", context);
+    } else if !entry.args_prefix.is_empty() {
+        anyhow::bail!("{}.args_prefix requires a 'program' matcher", context);
+    }
+
+    if let Some(pattern) = &entry.command_glob {
+        if pattern.is_empty() {
+            anyhow::bail!("{}.command_glob must not be empty", context);
+        }
+        Pattern::new(pattern).with_context(|| {
+            format!("{}.command_glob contains an invalid glob pattern", context)
+        })?;
+    }
+
+    if let Some(pattern) = &entry.command_regex {
+        if pattern.is_empty() {
+            anyhow::bail!("{}.command_regex must not be empty", context);
+        }
+        Regex::new(pattern).with_context(|| {
+            format!(
+                "{}.command_regex contains an invalid regular expression",
+                context
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn validate_shell_config(shell: &ShellConfig) -> Result<()> {
+    if shell.allowed_shells.is_empty() {
+        anyhow::bail!("shell.allowed_shells must contain at least one shell path");
+    }
+
+    let mut seen_shells = std::collections::HashSet::new();
+    for (index, shell_path) in shell.allowed_shells.iter().enumerate() {
+        if shell_path.trim().is_empty() {
+            anyhow::bail!("shell.allowed_shells[{}] must not be empty", index);
+        }
+        if !Path::new(shell_path).is_absolute() {
+            anyhow::bail!(
+                "shell.allowed_shells[{}] must be an absolute path: {}",
+                index,
+                shell_path
+            );
+        }
+        if !seen_shells.insert(shell_path) {
+            anyhow::bail!("Duplicate shell.allowed_shells entry '{}'", shell_path);
+        }
+    }
+
+    for (index, entry) in shell.always_on.iter().enumerate() {
+        validate_shell_policy_entry(entry, &format!("shell.always_on[{}]", index))?;
+    }
+
+    let mut seen_set_names = std::collections::HashSet::new();
+    for (set_index, set) in shell.policy_sets.iter().enumerate() {
+        if set.name.trim().is_empty() {
+            anyhow::bail!("shell.policy_sets[{}].name must not be empty", set_index);
+        }
+        if !seen_set_names.insert(set.name.to_ascii_lowercase()) {
+            anyhow::bail!("Duplicate shell policy set name '{}'", set.name);
+        }
+        if set.entries.is_empty() {
+            anyhow::bail!(
+                "shell.policy_sets[{}] ('{}') must contain at least one entry",
+                set_index,
+                set.name
+            );
+        }
+        for (entry_index, entry) in set.entries.iter().enumerate() {
+            validate_shell_policy_entry(
+                entry,
+                &format!("shell.policy_sets[{}].entries[{}]", set_index, entry_index),
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Get the config file path.
 ///
 /// Returns `~/.config/zo/config.toml` on both Linux and macOS.
@@ -207,7 +435,29 @@ pub fn load_config() -> Result<Config> {
 /// - No duplicate custom model names
 /// - Theme name is valid (if specified)
 /// - Inline color values are valid (if specified)
+/// - Shell policy configuration is valid (if specified)
 fn validate_config(config: &Config) -> Result<()> {
+    if let Some(models) = &config.models {
+        for (name, model_id) in models {
+            if name.trim().is_empty() {
+                anyhow::bail!(
+                    "Model alias names in [models] cannot be empty. Please specify a non-empty alias."
+                );
+            }
+
+            if model_id.trim().is_empty()
+                && !DEFAULT_MODELS
+                    .iter()
+                    .any(|(default_name, _)| *default_name == name)
+            {
+                anyhow::bail!(
+                    "Model alias '{}' in [models] has an empty model ID. Empty values are only valid for disabling built-in aliases.",
+                    name
+                );
+            }
+        }
+    }
+
     // Track custom model names to detect duplicates
     let mut seen_names = std::collections::HashSet::new();
 
@@ -258,6 +508,8 @@ fn validate_config(config: &Config) -> Result<()> {
         inline_colors.validate()?;
     }
 
+    validate_shell_config(&config.shell)?;
+
     Ok(())
 }
 
@@ -279,6 +531,7 @@ pub fn get_default_config() -> Config {
         theme: Some("base16-ocean.dark".to_string()),
         inline_colors: None,
         history_file: None, // History disabled by default
+        shell: ShellConfig::default(),
     }
 }
 
@@ -351,12 +604,39 @@ theme = "base16-ocean.dark"
 # emphasis = "black"
 # prompt = "blue"
 
+# Shell execution defaults and policies
+# Shell execution is disabled unless you pass --shell.
+# Even with --files read --shell, spawned commands still run with your normal user permissions.
+#
+# [shell]
+# default_action = "ask"   # allow | ask | deny
+# allowed_shells = ["/bin/sh", "/bin/bash", "/bin/zsh"]
+#
+# [[shell.always_on]]
+# action = "allow"
+# terminal = true       # optional: stop evaluating later rules for this match
+# program = "git"
+# args_prefix = [{{ exact = "status" }}]
+#
+# [[shell.policy_sets]]
+# name = "github_cli"
+#
+# [[shell.policy_sets.entries]]
+# action = "allow"
+# program = "gh"
+# args_prefix = [{{ exact = "pr" }}]
+
 # Model mappings (shortname -> OpenRouter model ID)
-# If you define this table, it completely overrides the built-in model list
-# This gives you full control over which models are available via slash commands
+# Built-in aliases stay available by default.
+# Use this table to override a built-in alias, add a new alias, or disable a built-in alias
+# by setting it to an empty string.
 #
 # Example - uncomment to use your own model list:
 {default_models_example_block}
+# Disable a built-in alias if it gets in the way of fuzzy matching:
+# [models]
+# sonnet = ""
+#
 # Custom model definitions
 # Define virtual model names that map to actual OpenRouter models
 # You can optionally include a system prompt for each custom model
@@ -401,6 +681,7 @@ mod tests {
             theme: Some("base16-ocean.dark".to_string()),
             inline_colors: None,
             history_file: None,
+            shell: ShellConfig::default(),
         };
 
         assert!(validate_config(&config).is_ok());
@@ -420,6 +701,7 @@ mod tests {
             theme: None,
             inline_colors: None,
             history_file: None,
+            shell: ShellConfig::default(),
         };
 
         let result = validate_config(&config);
@@ -441,6 +723,7 @@ mod tests {
             theme: None,
             inline_colors: None,
             history_file: None,
+            shell: ShellConfig::default(),
         };
 
         let result = validate_config(&config);
@@ -469,11 +752,58 @@ mod tests {
             theme: None,
             inline_colors: None,
             history_file: None,
+            shell: ShellConfig::default(),
         };
 
         let result = validate_config(&config);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Duplicate"));
+    }
+
+    #[test]
+    fn test_validate_config_allows_empty_model_for_builtin_disable() {
+        let config = Config {
+            api_key: None,
+            default_model: None,
+            models: Some(std::collections::HashMap::from([(
+                "sonnet".to_string(),
+                "".to_string(),
+            )])),
+            custom_models: vec![],
+            theme: None,
+            inline_colors: None,
+            history_file: None,
+            shell: ShellConfig::default(),
+        };
+
+        let result = validate_config(&config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_config_rejects_empty_model_for_unknown_alias() {
+        let config = Config {
+            api_key: None,
+            default_model: None,
+            models: Some(std::collections::HashMap::from([(
+                "myalias".to_string(),
+                "".to_string(),
+            )])),
+            custom_models: vec![],
+            theme: None,
+            inline_colors: None,
+            history_file: None,
+            shell: ShellConfig::default(),
+        };
+
+        let result = validate_config(&config);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Empty values are only valid for disabling built-in aliases")
+        );
     }
 
     #[test]
@@ -486,6 +816,7 @@ mod tests {
             theme: Some("base16-ocean.dark".to_string()),
             inline_colors: None,
             history_file: None,
+            shell: ShellConfig::default(),
         };
 
         let result = validate_config(&config);
@@ -502,6 +833,7 @@ mod tests {
             theme: Some("nonexistent-theme".to_string()),
             inline_colors: None,
             history_file: None,
+            shell: ShellConfig::default(),
         };
 
         let result = validate_config(&config);
@@ -524,6 +856,7 @@ mod tests {
                 prompt: Some("  CYAN ".to_string()),
             }),
             history_file: None,
+            shell: ShellConfig::default(),
         };
 
         let result = validate_config(&config);
@@ -545,6 +878,7 @@ mod tests {
                 prompt: None,
             }),
             history_file: None,
+            shell: ShellConfig::default(),
         };
 
         let result = validate_config(&config);
@@ -569,6 +903,7 @@ mod tests {
                 prompt: None,
             }),
             history_file: None,
+            shell: ShellConfig::default(),
         };
 
         let result = validate_config(&config);
@@ -576,6 +911,222 @@ mod tests {
         let error = result.unwrap_err().to_string();
         assert!(error.contains("inline_colors.inline_code"));
         assert!(error.contains("#12G45Z"));
+    }
+
+    #[test]
+    fn test_validate_config_rejects_duplicate_shell_policy_sets() {
+        let config = Config {
+            api_key: None,
+            default_model: None,
+            models: None,
+            custom_models: vec![],
+            theme: None,
+            inline_colors: None,
+            history_file: None,
+            shell: ShellConfig {
+                policy_sets: vec![
+                    ShellPolicySet {
+                        name: "git".to_string(),
+                        entries: vec![ShellPolicyEntry {
+                            action: ShellPolicyAction::Allow,
+                            terminal: false,
+                            program: Some("git".to_string()),
+                            args: vec![],
+                            args_prefix: vec![],
+                            command_glob: None,
+                            command_regex: None,
+                        }],
+                    },
+                    ShellPolicySet {
+                        name: "Git".to_string(),
+                        entries: vec![ShellPolicyEntry {
+                            action: ShellPolicyAction::Ask,
+                            terminal: false,
+                            program: Some("git".to_string()),
+                            args: vec![],
+                            args_prefix: vec![],
+                            command_glob: None,
+                            command_regex: None,
+                        }],
+                    },
+                ],
+                ..ShellConfig::default()
+            },
+        };
+
+        let result = validate_config(&config);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Duplicate shell policy set name")
+        );
+    }
+
+    #[test]
+    fn test_validate_config_rejects_invalid_shell_arg_regex() {
+        let config = Config {
+            api_key: None,
+            default_model: None,
+            models: None,
+            custom_models: vec![],
+            theme: None,
+            inline_colors: None,
+            history_file: None,
+            shell: ShellConfig {
+                always_on: vec![ShellPolicyEntry {
+                    action: ShellPolicyAction::Allow,
+                    terminal: false,
+                    program: Some("head".to_string()),
+                    args: vec![ShellArgMatcher {
+                        exact: None,
+                        glob: None,
+                        regex: Some("(".to_string()),
+                    }],
+                    args_prefix: vec![],
+                    command_glob: None,
+                    command_regex: None,
+                }],
+                ..ShellConfig::default()
+            },
+        };
+
+        let result = validate_config(&config);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid regular expression")
+        );
+    }
+
+    #[test]
+    fn test_shell_policy_entry_terminal_defaults_false() {
+        let config: Config = toml::from_str(
+            r#"
+                [shell]
+
+                [[shell.always_on]]
+                action = "allow"
+                program = "git"
+            "#,
+        )
+        .unwrap();
+
+        assert!(!config.shell.always_on[0].terminal);
+    }
+
+    #[test]
+    fn test_validate_config_accepts_args_prefix() {
+        let config = Config {
+            api_key: None,
+            default_model: None,
+            models: None,
+            custom_models: vec![],
+            theme: None,
+            inline_colors: None,
+            history_file: None,
+            shell: ShellConfig {
+                always_on: vec![ShellPolicyEntry {
+                    action: ShellPolicyAction::Allow,
+                    terminal: false,
+                    program: Some("git".to_string()),
+                    args: vec![],
+                    args_prefix: vec![ShellArgMatcher {
+                        exact: Some("status".to_string()),
+                        glob: None,
+                        regex: None,
+                    }],
+                    command_glob: None,
+                    command_regex: None,
+                }],
+                ..ShellConfig::default()
+            },
+        };
+
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_config_rejects_args_and_args_prefix_combination() {
+        let config = Config {
+            api_key: None,
+            default_model: None,
+            models: None,
+            custom_models: vec![],
+            theme: None,
+            inline_colors: None,
+            history_file: None,
+            shell: ShellConfig {
+                always_on: vec![ShellPolicyEntry {
+                    action: ShellPolicyAction::Allow,
+                    terminal: false,
+                    program: Some("git".to_string()),
+                    args: vec![ShellArgMatcher {
+                        exact: Some("status".to_string()),
+                        glob: None,
+                        regex: None,
+                    }],
+                    args_prefix: vec![ShellArgMatcher {
+                        exact: Some("status".to_string()),
+                        glob: None,
+                        regex: None,
+                    }],
+                    command_glob: None,
+                    command_regex: None,
+                }],
+                ..ShellConfig::default()
+            },
+        };
+
+        let result = validate_config(&config);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("cannot combine 'args' with 'args_prefix'")
+        );
+    }
+
+    #[test]
+    fn test_validate_config_rejects_args_prefix_without_program() {
+        let config = Config {
+            api_key: None,
+            default_model: None,
+            models: None,
+            custom_models: vec![],
+            theme: None,
+            inline_colors: None,
+            history_file: None,
+            shell: ShellConfig {
+                always_on: vec![ShellPolicyEntry {
+                    action: ShellPolicyAction::Allow,
+                    terminal: false,
+                    program: None,
+                    args: vec![],
+                    args_prefix: vec![ShellArgMatcher {
+                        exact: Some("status".to_string()),
+                        glob: None,
+                        regex: None,
+                    }],
+                    command_glob: Some("git *".to_string()),
+                    command_regex: None,
+                }],
+                ..ShellConfig::default()
+            },
+        };
+
+        let result = validate_config(&config);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains(".args_prefix requires a 'program' matcher")
+        );
     }
 
     #[test]

@@ -16,7 +16,7 @@ pub const DEFAULT_TEXT_MODEL_ID: &str = "openai/gpt-5.4";
 /// Default models mapping short names to OpenRouter model IDs
 pub const DEFAULT_MODELS: &[(&str, &str)] = &[
     (DEFAULT_TEXT_MODEL_NAME, DEFAULT_TEXT_MODEL_ID),
-    ("flash", "google/gemini-flash-latest"),
+    ("flash", "google/gemini-3-flash-preview"),
     ("geminipro", "google/gemini-pro-latest"),
     ("gpt4.1", "openai/gpt-4.1"),
     ("gpt4o", "openai/gpt-4o"),
@@ -31,12 +31,86 @@ pub const DEFAULT_MODELS: &[(&str, &str)] = &[
     ("banana", "google/gemini-3-pro-image-preview"),
 ];
 
-/// Build model map from config or default models.
+struct ResolvedBaseModels {
+    builtins: Vec<(String, ModelEntry)>,
+    extras: Vec<(String, ModelEntry)>,
+}
+
+fn is_builtin_model_name(name: &str) -> bool {
+    DEFAULT_MODELS
+        .iter()
+        .any(|(default_name, _)| *default_name == name)
+}
+
+fn is_disabled_builtin_alias(config: &Config, input: &str) -> bool {
+    DEFAULT_MODELS.iter().any(|(name, _)| {
+        name.eq_ignore_ascii_case(input)
+            && config
+                .models
+                .as_ref()
+                .and_then(|models| models.get(*name))
+                .is_some_and(|model_id| model_id.trim().is_empty())
+    })
+}
+
+fn resolve_base_models(config: &Config) -> ResolvedBaseModels {
+    let mut builtins = Vec::new();
+
+    for (name, default_model_id) in DEFAULT_MODELS {
+        match config.models.as_ref().and_then(|models| models.get(*name)) {
+            Some(model_id) if model_id.trim().is_empty() => {}
+            Some(model_id) => builtins.push((
+                name.to_string(),
+                ModelEntry {
+                    model_id: model_id.clone(),
+                    system_prompt: None,
+                },
+            )),
+            None => builtins.push((
+                name.to_string(),
+                ModelEntry {
+                    model_id: default_model_id.to_string(),
+                    system_prompt: None,
+                },
+            )),
+        }
+    }
+
+    let mut extras = Vec::new();
+    if let Some(config_models) = &config.models {
+        let mut extra_names: Vec<&String> = config_models
+            .keys()
+            .filter(|name| !is_builtin_model_name(name))
+            .collect();
+        extra_names.sort();
+
+        for name in extra_names {
+            let model_id = config_models.get(name).unwrap();
+            if model_id.trim().is_empty() {
+                continue;
+            }
+
+            extras.push((
+                name.clone(),
+                ModelEntry {
+                    model_id: model_id.clone(),
+                    system_prompt: None,
+                },
+            ));
+        }
+    }
+
+    ResolvedBaseModels { builtins, extras }
+}
+
+/// Build model map from built-in models, `[models]` config overrides, and custom models.
 ///
-/// If `config.models` is defined, uses only those models (completely overrides defaults).
-/// Otherwise, uses the default models defined in [`DEFAULT_MODELS`].
-/// In both cases, custom models from `config.custom_models` are added and can override
-/// any model with the same name.
+/// Built-in aliases remain available by default. Entries in `[models]` can:
+/// - override a built-in alias by reusing the same name with a non-empty model ID
+/// - disable a built-in alias by assigning an empty string
+/// - add extra aliases with new names
+///
+/// `custom_models` are applied last and can override any alias with the same name.
 ///
 /// # Arguments
 /// * `config` - The loaded configuration containing model definitions
@@ -46,30 +120,10 @@ pub const DEFAULT_MODELS: &[(&str, &str)] = &[
 /// [`ModelEntry`] structs containing the full model ID and optional system prompt.
 pub fn build_model_map(config: &Config) -> HashMap<String, ModelEntry> {
     let mut map = HashMap::new();
+    let base_models = resolve_base_models(config);
 
-    // Use config models if present, otherwise use defaults
-    if let Some(config_models) = &config.models {
-        // Add config-defined models
-        for (name, model_id) in config_models {
-            map.insert(
-                name.clone(),
-                ModelEntry {
-                    model_id: model_id.clone(),
-                    system_prompt: None,
-                },
-            );
-        }
-    } else {
-        // Add default models
-        for (name, model_id) in DEFAULT_MODELS {
-            map.insert(
-                name.to_string(),
-                ModelEntry {
-                    model_id: model_id.to_string(),
-                    system_prompt: None,
-                },
-            );
-        }
+    for (name, entry) in base_models.builtins.iter().chain(base_models.extras.iter()) {
+        map.insert(name.clone(), entry.clone());
     }
 
     // Add custom models from config (these override any model with same name)
@@ -94,8 +148,8 @@ pub fn build_model_map(config: &Config) -> HashMap<String, ModelEntry> {
 /// 3. **Fuzzy match**: "sonn" matches "sonnet" (with score >= 50)
 ///
 /// Custom models from the config are checked before base models at each stage.
-/// Base models come from either `config.models` (if defined) or `DEFAULT_MODELS`.
-/// This ensures that custom models with system prompts take precedence.
+/// Among non-custom aliases, built-in aliases are checked before extra aliases added
+/// via `[models]`. This keeps built-ins available unless they are explicitly disabled.
 ///
 /// # Arguments
 /// * `input` - The user's input string (e.g., "pro", "sonn", "flash", "gpt")
@@ -118,6 +172,11 @@ pub fn select_model(
     model_map: &HashMap<String, ModelEntry>,
     config: &Config,
 ) -> Option<ModelEntry> {
+    if is_disabled_builtin_alias(config, input) {
+        return None;
+    }
+
+    let base_models = resolve_base_models(config);
     let input_lower = input.to_lowercase();
 
     // Helper to check a single model against input at a specific stage
@@ -134,21 +193,11 @@ pub fn select_model(
             }
         }
     }
-    // Then check base models (config.models or DEFAULT_MODELS)
-    if let Some(config_models) = &config.models {
-        for name in config_models.keys() {
-            if check_exact(name) {
-                if let Some(entry) = model_map.get(name) {
-                    return Some(entry.clone());
-                }
-            }
-        }
-    } else {
-        for (name, _) in DEFAULT_MODELS {
-            if check_exact(name) {
-                if let Some(entry) = model_map.get(*name) {
-                    return Some(entry.clone());
-                }
+    // Then check built-in aliases and extra aliases from [models]
+    for (name, _) in base_models.builtins.iter().chain(base_models.extras.iter()) {
+        if check_exact(name) {
+            if let Some(entry) = model_map.get(name) {
+                return Some(entry.clone());
             }
         }
     }
@@ -162,72 +211,60 @@ pub fn select_model(
             }
         }
     }
-    // Then check base models (config.models or DEFAULT_MODELS)
-    if let Some(config_models) = &config.models {
-        for name in config_models.keys() {
-            if check_substring(name) {
-                if let Some(entry) = model_map.get(name) {
-                    return Some(entry.clone());
-                }
+    for (name, _) in &base_models.builtins {
+        if check_substring(name) {
+            if let Some(entry) = model_map.get(name) {
+                return Some(entry.clone());
             }
         }
-    } else {
-        for (name, _) in DEFAULT_MODELS {
-            if check_substring(name) {
-                if let Some(entry) = model_map.get(*name) {
-                    return Some(entry.clone());
-                }
+    }
+    for (name, _) in &base_models.extras {
+        if check_substring(name) {
+            if let Some(entry) = model_map.get(name) {
+                return Some(entry.clone());
             }
         }
     }
 
     // Stage 3: Try fuzzy matching - find best match across all models
     let matcher = SkimMatcherV2::default();
-    let mut best_custom_match: Option<(&ModelEntry, i64)> = None;
-    let mut best_base_match: Option<(&ModelEntry, i64)> = None;
+    let mut best_custom_match: Option<(String, i64)> = None;
+    let mut best_builtin_match: Option<(String, i64)> = None;
+    let mut best_extra_match: Option<(String, i64)> = None;
 
     // Check custom models
     for custom in &config.custom_models {
-        if let Some(entry) = model_map.get(&custom.name) {
-            if let Some(score) = matcher.fuzzy_match(&custom.name, input) {
-                if let Some((_, best_score)) = best_custom_match {
-                    if score > best_score {
-                        best_custom_match = Some((entry, score));
-                    }
-                } else {
-                    best_custom_match = Some((entry, score));
+        if let Some(score) = matcher.fuzzy_match(&custom.name, input) {
+            if let Some((_, best_score)) = &best_custom_match {
+                if score > *best_score {
+                    best_custom_match = Some((custom.name.clone(), score));
                 }
+            } else {
+                best_custom_match = Some((custom.name.clone(), score));
             }
         }
     }
 
-    // Check base models (config.models or DEFAULT_MODELS)
-    if let Some(config_models) = &config.models {
-        for name in config_models.keys() {
-            if let Some(entry) = model_map.get(name) {
-                if let Some(score) = matcher.fuzzy_match(name, input) {
-                    if let Some((_, best_score)) = best_base_match {
-                        if score > best_score {
-                            best_base_match = Some((entry, score));
-                        }
-                    } else {
-                        best_base_match = Some((entry, score));
-                    }
+    for (name, _) in &base_models.builtins {
+        if let Some(score) = matcher.fuzzy_match(name, input) {
+            if let Some((_, best_score)) = &best_builtin_match {
+                if score > *best_score {
+                    best_builtin_match = Some((name.clone(), score));
                 }
+            } else {
+                best_builtin_match = Some((name.clone(), score));
             }
         }
-    } else {
-        for (name, _) in DEFAULT_MODELS {
-            if let Some(entry) = model_map.get(*name) {
-                if let Some(score) = matcher.fuzzy_match(name, input) {
-                    if let Some((_, best_score)) = best_base_match {
-                        if score > best_score {
-                            best_base_match = Some((entry, score));
-                        }
-                    } else {
-                        best_base_match = Some((entry, score));
-                    }
+    }
+
+    for (name, _) in &base_models.extras {
+        if let Some(score) = matcher.fuzzy_match(name, input) {
+            if let Some((_, best_score)) = &best_extra_match {
+                if score > *best_score {
+                    best_extra_match = Some((name.clone(), score));
                 }
+            } else {
+                best_extra_match = Some((name.clone(), score));
             }
         }
     }
@@ -236,15 +273,27 @@ pub fn select_model(
     const MIN_SCORE: i64 = 50;
 
     // Prefer custom model match over base model match
-    if let Some((entry, score)) = best_custom_match {
+    if let Some((name, score)) = best_custom_match {
         if score >= MIN_SCORE {
-            return Some(entry.clone());
+            if let Some(entry) = model_map.get(&name) {
+                return Some(entry.clone());
+            }
         }
     }
 
-    if let Some((entry, score)) = best_base_match {
+    if let Some((name, score)) = best_builtin_match {
         if score >= MIN_SCORE {
-            return Some(entry.clone());
+            if let Some(entry) = model_map.get(&name) {
+                return Some(entry.clone());
+            }
+        }
+    }
+
+    if let Some((name, score)) = best_extra_match {
+        if score >= MIN_SCORE {
+            if let Some(entry) = model_map.get(&name) {
+                return Some(entry.clone());
+            }
         }
     }
 
@@ -278,8 +327,8 @@ pub fn get_fuzzy_matches(
         }
     }
 
-    // Sort by score (descending)
-    matches.sort_by(|a, b| b.2.cmp(&a.2));
+    // Sort by score (descending), then name (ascending) for stable output
+    matches.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
 
     // Return top N matches
     matches.into_iter().take(limit).collect()
@@ -304,7 +353,7 @@ pub fn list_model_names(model_map: &HashMap<String, ModelEntry>) -> Vec<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, CustomModel};
+    use crate::config::{Config, CustomModel, ShellConfig};
 
     fn create_test_config() -> Config {
         Config {
@@ -319,6 +368,7 @@ mod tests {
             theme: None,
             inline_colors: None,
             history_file: None,
+            shell: ShellConfig::default(),
         }
     }
 
@@ -332,6 +382,7 @@ mod tests {
             theme: None,
             inline_colors: None,
             history_file: None,
+            shell: ShellConfig::default(),
         };
 
         let model_map = build_model_map(&config);
@@ -353,7 +404,7 @@ mod tests {
         );
         assert_eq!(
             model_map.get("flash").unwrap().model_id,
-            "google/gemini-flash-latest"
+            "google/gemini-3-flash-preview"
         );
         assert_eq!(
             model_map.get("geminipro").unwrap().model_id,
@@ -392,6 +443,7 @@ mod tests {
             theme: None,
             inline_colors: None,
             history_file: None,
+            shell: ShellConfig::default(),
         };
 
         let model_map = build_model_map(&config);
@@ -412,6 +464,7 @@ mod tests {
             theme: None,
             inline_colors: None,
             history_file: None,
+            shell: ShellConfig::default(),
         };
         let model_map = build_model_map(&config);
 
@@ -431,6 +484,7 @@ mod tests {
             theme: None,
             inline_colors: None,
             history_file: None,
+            shell: ShellConfig::default(),
         };
         let model_map = build_model_map(&config);
 
@@ -455,6 +509,7 @@ mod tests {
             theme: None,
             inline_colors: None,
             history_file: None,
+            shell: ShellConfig::default(),
         };
         let model_map = build_model_map(&config);
 
@@ -478,6 +533,7 @@ mod tests {
             theme: None,
             inline_colors: None,
             history_file: None,
+            shell: ShellConfig::default(),
         };
         let model_map = build_model_map(&config);
 
@@ -496,6 +552,7 @@ mod tests {
             theme: None,
             inline_colors: None,
             history_file: None,
+            shell: ShellConfig::default(),
         };
         let model_map = build_model_map(&config);
 
@@ -538,6 +595,7 @@ mod tests {
             theme: None,
             inline_colors: None,
             history_file: None,
+            shell: ShellConfig::default(),
         };
         let model_map = build_model_map(&config);
 
@@ -557,6 +615,7 @@ mod tests {
             theme: None,
             inline_colors: None,
             history_file: None,
+            shell: ShellConfig::default(),
         };
         let model_map = build_model_map(&config);
 
@@ -576,6 +635,7 @@ mod tests {
             theme: None,
             inline_colors: None,
             history_file: None,
+            shell: ShellConfig::default(),
         };
         let model_map = build_model_map(&config);
 
@@ -600,6 +660,7 @@ mod tests {
             theme: None,
             inline_colors: None,
             history_file: None,
+            shell: ShellConfig::default(),
         };
         let model_map = build_model_map(&config);
 
@@ -621,6 +682,7 @@ mod tests {
             theme: None,
             inline_colors: None,
             history_file: None,
+            shell: ShellConfig::default(),
         };
         let model_map = build_model_map(&config);
 
@@ -644,6 +706,10 @@ mod tests {
             "sonnet".to_string(),
             "my-provider/my-sonnet-model".to_string(),
         );
+        custom_models.insert(
+            "myalias".to_string(),
+            "my-provider/my-extra-model".to_string(),
+        );
 
         let config = Config {
             api_key: None,
@@ -653,18 +719,20 @@ mod tests {
             theme: None,
             inline_colors: None,
             history_file: None,
+            shell: ShellConfig::default(),
         };
 
         let model_map = build_model_map(&config);
 
-        // Should only contain the 2 models from config.models
-        assert_eq!(model_map.len(), 2);
+        // Built-ins stay available, existing aliases can be overridden, and new aliases can be added
+        assert_eq!(model_map.len(), DEFAULT_MODELS.len() + 1);
         assert!(model_map.contains_key("flash"));
         assert!(model_map.contains_key("sonnet"));
+        assert!(model_map.contains_key("myalias"));
 
-        // Should NOT contain default models
-        assert!(!model_map.contains_key("gpt4o"));
-        assert!(!model_map.contains_key("geminipro"));
+        // Other default models remain available
+        assert!(model_map.contains_key("gpt4o"));
+        assert!(model_map.contains_key("geminipro"));
 
         // Verify the custom model IDs
         assert_eq!(
@@ -674,6 +742,10 @@ mod tests {
         assert_eq!(
             model_map.get("sonnet").unwrap().model_id,
             "my-provider/my-sonnet-model"
+        );
+        assert_eq!(
+            model_map.get("myalias").unwrap().model_id,
+            "my-provider/my-extra-model"
         );
     }
 
@@ -699,14 +771,16 @@ mod tests {
             theme: None,
             inline_colors: None,
             history_file: None,
+            shell: ShellConfig::default(),
         };
 
         let model_map = build_model_map(&config);
 
-        // Should contain both config.models and custom_models
-        assert_eq!(model_map.len(), 2);
+        // Built-ins remain, flash is overridden, and the custom model is added
+        assert_eq!(model_map.len(), DEFAULT_MODELS.len() + 1);
         assert!(model_map.contains_key("flash"));
         assert!(model_map.contains_key("coder"));
+        assert!(model_map.contains_key("sonnet"));
 
         // Verify custom model has system prompt
         let coder = model_map.get("coder").unwrap();
@@ -715,5 +789,82 @@ mod tests {
             coder.system_prompt,
             Some("You are a coding assistant".to_string())
         );
+    }
+
+    #[test]
+    fn test_config_models_can_disable_builtin_alias() {
+        use std::collections::HashMap;
+
+        let mut config_models = HashMap::new();
+        config_models.insert("sonnet".to_string(), "".to_string());
+
+        let config = Config {
+            api_key: None,
+            default_model: None,
+            models: Some(config_models),
+            custom_models: vec![],
+            theme: None,
+            inline_colors: None,
+            history_file: None,
+            shell: ShellConfig::default(),
+        };
+
+        let model_map = build_model_map(&config);
+
+        assert!(!model_map.contains_key("sonnet"));
+        assert!(model_map.contains_key("flash"));
+        assert_eq!(model_map.len(), DEFAULT_MODELS.len() - 1);
+        assert!(select_model("sonnet", &model_map, &config).is_none());
+    }
+
+    #[test]
+    fn test_select_model_builtin_substring_takes_precedence_over_added_alias() {
+        use std::collections::HashMap;
+
+        let mut config_models = HashMap::new();
+        config_models.insert("mypro".to_string(), "custom/my-pro-model".to_string());
+
+        let config = Config {
+            api_key: None,
+            default_model: None,
+            models: Some(config_models),
+            custom_models: vec![],
+            theme: None,
+            inline_colors: None,
+            history_file: None,
+            shell: ShellConfig::default(),
+        };
+
+        let model_map = build_model_map(&config);
+        let result = select_model("pro", &model_map, &config).unwrap();
+
+        assert_eq!(result.model_id, "google/gemini-pro-latest");
+    }
+
+    #[test]
+    fn test_select_model_builtin_fuzzy_takes_precedence_over_added_alias() {
+        use std::collections::HashMap;
+
+        let mut config_models = HashMap::new();
+        config_models.insert("sxonnet".to_string(), "custom/my-sonnet-model".to_string());
+
+        let config = Config {
+            api_key: None,
+            default_model: None,
+            models: Some(config_models),
+            custom_models: vec![],
+            theme: None,
+            inline_colors: None,
+            history_file: None,
+            shell: ShellConfig::default(),
+        };
+
+        let model_map = build_model_map(&config);
+        let matcher = SkimMatcherV2::default();
+        assert!(matcher.fuzzy_match("sonnet", "sonet").is_some());
+        assert!(matcher.fuzzy_match("sxonnet", "sonet").is_some());
+
+        let result = select_model("sonet", &model_map, &config).unwrap();
+        assert_eq!(result.model_id, "anthropic/claude-sonnet-4.5");
     }
 }

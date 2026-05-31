@@ -17,7 +17,8 @@ name = "zo"
 path = "src/main.rs"
 
 [dependencies]
-openrouter-rs = "0.5.0"
+openrouter-rs = "0.5.2"
+base64 = "0.22"
 clap = { version = "4.4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -38,6 +39,7 @@ rustyline = "14.0"
 grep = "0.3"
 ignore = "0.4"
 regex = "1.11"
+libc = "0.2"
 
 [target.'cfg(not(windows))'.dependencies]
 openssl = { version = "0.10", features = ["vendored"] }

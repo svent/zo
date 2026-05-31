@@ -17,13 +17,15 @@ mod models;
 mod readline;
 mod render;
 mod session;
+mod shell;
 mod system_prompt;
 mod tools;
 
 use config::Config;
 use input::ParsedInput;
 use models::ModelEntry;
-use tools::{ToolMode, ToolsCliMode};
+use shell::ShellRuntime;
+use tools::{FileCliAccess, FileToolMode, ToolAccess};
 
 /// zo - OpenRouter CLI Assistant
 #[derive(Parser)]
@@ -33,7 +35,7 @@ use tools::{ToolMode, ToolsCliMode};
     about = "Zettabyte Oracle - A CLI tool for interacting with language models via OpenRouter",
     override_usage = r#"zo [OPTIONS] [PROMPT]
        zo --chat
-       zo --image -o <FILE> [PROMPT]
+       zo --image <FILE> [PROMPT]
        zo +ACTION"#,
     after_help = r#"
 Actions:
@@ -43,11 +45,12 @@ Actions:
 Examples:
     zo +list-models
     zo /codex "Explain lifetimes"
-    zo --tools ro "inspect this project"
-    zo --tools rw "refactor the repo"
+    zo --files read "inspect this project"
+    zo --files write --accept-writes "refactor the repo"
+    zo --shell "run tests in this repo"
     zo --chat
     zo --chat "Let's talk"
-    zo --image -o assets/cat.png "Watercolor cat portrait"
+    zo --image assets/cat.png "Watercolor cat portrait"
     "#
 )]
 struct Cli {
@@ -60,7 +63,7 @@ struct Cli {
     model: Option<String>,
 
     /// Enable debug mode - show diagnostic info and ask for confirmation before sending request
-    #[arg(short, long)]
+    #[arg(short, long, conflicts_with = "non_interactive")]
     debug: bool,
 
     /// Show tool calls requested by the model as they are executed
@@ -71,21 +74,29 @@ struct Cli {
     #[arg(short, long)]
     chat: bool,
 
-    /// Generate a single image and exit
-    #[arg(long, requires = "output", conflicts_with_all = ["chat", "tools"])]
-    image: bool,
+    /// Generate a single image and save it to FILE
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["chat", "files", "shell", "policies"])]
+    image: Option<String>,
 
-    /// Save generated image to FILE (required with --image)
-    #[arg(short, long, value_name = "FILE", requires = "image")]
-    output: Option<String>,
-
-    /// Automatically approve all file changes without confirmation
+    /// Approve file overwrites and edits without confirmation
     #[arg(long, short = 'y')]
-    yes: bool,
+    accept_writes: bool,
 
-    /// Enable comprehensive tool access
-    #[arg(short = 't', long, value_enum)]
-    tools: Option<ToolsCliMode>,
+    /// Enable file tools: read or write
+    #[arg(long, value_enum)]
+    files: Option<FileCliAccess>,
+
+    /// Enable shell tools
+    #[arg(long)]
+    shell: bool,
+
+    /// Activate named shell policy sets (comma-separated)
+    #[arg(long, value_delimiter = ',')]
+    policies: Vec<String>,
+
+    /// Never prompt; anything requiring approval is denied unless already accepted
+    #[arg(long)]
+    non_interactive: bool,
 
     /// Allow tool access to hidden files/directories (dotfiles)
     #[arg(long)]
@@ -185,7 +196,10 @@ fn display_debug_info(
     model_name: &str,
     model_entry: &ModelEntry,
     parsed_input: &ParsedInput,
-    tool_mode: ToolMode,
+    tool_access: ToolAccess,
+    active_policies: &[String],
+    accept_writes: bool,
+    non_interactive: bool,
     allow_hidden: bool,
 ) {
     println!("=== DEBUG MODE ===\n");
@@ -197,7 +211,7 @@ fn display_debug_info(
     let system_prompt = system_prompt::build_system_prompt(
         model_entry,
         &parsed_input.output_files,
-        tool_mode,
+        tool_access,
         allow_hidden,
     );
 
@@ -254,11 +268,40 @@ fn display_debug_info(
     }
 
     println!("\nTool Mode:");
-    match tool_mode {
-        ToolMode::Disabled => println!("  disabled"),
-        ToolMode::ReadOnly => println!("  ro (constrained read tools + scoped writes)"),
-        ToolMode::ReadWrite => println!("  rw (full workspace tools)"),
+    match tool_access.file_mode {
+        FileToolMode::Disabled => println!("  file tools: disabled"),
+        FileToolMode::ReadOnly => {
+            println!("  file tools: read (constrained read tools + scoped writes)")
+        }
+        FileToolMode::ReadWrite => println!("  file tools: write (full workspace tools)"),
     }
+    println!(
+        "  shell tools: {}",
+        if tool_access.shell_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    if !active_policies.is_empty() {
+        println!("  shell policies: {}", active_policies.join(", "));
+    }
+    println!(
+        "  overwrite approvals: {}",
+        if accept_writes {
+            "auto (--accept-writes)"
+        } else {
+            "ask when needed"
+        }
+    );
+    println!(
+        "  interactive confirmations: {}",
+        if non_interactive {
+            "disabled (--non-interactive)"
+        } else {
+            "enabled"
+        }
+    );
     println!(
         "  hidden paths: {}",
         if allow_hidden {
@@ -367,9 +410,9 @@ async fn run_image_mode(
     model_override: Option<String>,
 ) -> Result<()> {
     let output_path = cli
-        .output
+        .image
         .clone()
-        .expect("clap should require --output when --image is set");
+        .expect("clap should require an output path when --image is set");
     file_ops::validate_binary_output_path(&output_path, cli.hidden)
         .context("Invalid image output path")?;
 
@@ -418,8 +461,9 @@ async fn run_image_mode(
         modalities,
         image::ImageGenerationOptions {
             output_path,
-            auto_approve: cli.yes,
+            accept_writes: cli.accept_writes,
             allow_hidden: cli.hidden,
+            non_interactive: cli.non_interactive,
         },
     )
     .await
@@ -451,7 +495,7 @@ async fn main() -> Result<()> {
     }
 
     // If no arguments and not chat mode, show help
-    if cli.args.is_empty() && !cli.chat && !cli.image {
+    if cli.args.is_empty() && !cli.chat && cli.image.is_none() {
         use clap::CommandFactory;
         let mut cmd = Cli::command();
         cmd.print_help()?;
@@ -463,7 +507,7 @@ async fn main() -> Result<()> {
     let config = config::load_config().context("Failed to load configuration")?;
 
     // Parse input (args + STDIN)
-    let parsed_input = if cli.image {
+    let parsed_input = if cli.image.is_some() {
         input::parse_image_input(cli.args.clone()).context("Failed to parse image input")?
     } else {
         input::parse_input(cli.args.clone()).context("Failed to parse input")?
@@ -472,14 +516,34 @@ async fn main() -> Result<()> {
     // Determine final model override (CLI flag takes precedence over slash command)
     let model_override = cli.model.clone().or(parsed_input.model_override.clone());
 
-    if cli.image {
+    if cli.image.is_some() {
         return run_image_mode(&cli, &config, parsed_input, model_override).await;
     }
 
-    // Resolve tool mode from CLI
-    let tool_mode = ToolMode::from(cli.tools);
+    let tool_access = ToolAccess::from_cli(cli.files, cli.shell);
+    if !cli.shell && !cli.policies.is_empty() {
+        bail!("--policies requires --shell");
+    }
+    #[cfg(not(unix))]
+    if cli.shell {
+        bail!("Shell tools are only supported on Unix platforms in this version.");
+    }
     let show_tool_calls = cli.debug || cli.verbose;
     let show_full_tool_args = cli.debug;
+
+    let shell_runtime = if tool_access.shell_enabled {
+        Some(
+            ShellRuntime::new(
+                &config.shell,
+                &cli.policies,
+                cli.non_interactive,
+                show_tool_calls,
+            )
+            .context("Invalid shell policy selection")?,
+        )
+    } else {
+        None
+    };
 
     // Resolve which model to use (with fuzzy matching)
     let (model_name, model_entry) =
@@ -491,7 +555,10 @@ async fn main() -> Result<()> {
             &model_name,
             &model_entry,
             &parsed_input,
-            tool_mode,
+            tool_access,
+            &cli.policies,
+            cli.accept_writes,
+            cli.non_interactive,
             cli.hidden,
         );
 
@@ -522,11 +589,13 @@ async fn main() -> Result<()> {
             chat::ChatSessionOptions {
                 initial_prompt: parsed_input.prompt,
                 initial_stdin: parsed_input.stdin_content,
-                auto_approve: cli.yes,
+                accept_writes: cli.accept_writes,
                 theme_name: theme_name.to_string(),
                 inline_colors,
                 history_file: config.history_file,
-                tool_mode,
+                tool_access,
+                shell_runtime: shell_runtime.clone(),
+                non_interactive: cli.non_interactive,
                 allow_hidden: cli.hidden,
                 show_tool_calls,
                 show_full_tool_args,
@@ -560,10 +629,12 @@ async fn main() -> Result<()> {
             client,
             model_entry,
             parsed_input.output_files,
-            cli.yes,
+            cli.accept_writes,
             theme_name.to_string(),
             inline_colors,
-            tool_mode,
+            tool_access,
+            shell_runtime.clone(),
+            cli.non_interactive,
             cli.hidden,
             show_tool_calls,
             show_full_tool_args,
@@ -582,6 +653,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ShellConfig;
 
     #[test]
     fn test_resolve_text_model_uses_builtin_fallback_when_config_default_missing() {
@@ -593,6 +665,7 @@ mod tests {
             theme: None,
             inline_colors: None,
             history_file: None,
+            shell: ShellConfig::default(),
         };
 
         let (model_name, model_entry) = resolve_text_model(None, &config).unwrap();
@@ -615,6 +688,7 @@ mod tests {
             theme: None,
             inline_colors: None,
             history_file: None,
+            shell: ShellConfig::default(),
         };
 
         let (model_name, model_entry) = resolve_text_model(None, &config).unwrap();
@@ -624,28 +698,47 @@ mod tests {
     }
 
     #[test]
-    fn test_tools_flag_explicit_ro() {
-        let cli = Cli::try_parse_from(["zo", "--tools", "ro", "hello"]).unwrap();
-        assert_eq!(cli.tools, Some(ToolsCliMode::Ro));
+    fn test_files_flag_explicit_read() {
+        let cli = Cli::try_parse_from(["zo", "--files", "read", "hello"]).unwrap();
+        assert_eq!(cli.files, Some(FileCliAccess::Read));
         assert_eq!(cli.args, vec!["hello"]);
     }
 
     #[test]
-    fn test_tools_flag_explicit_rw() {
-        let cli = Cli::try_parse_from(["zo", "--tools", "rw", "hello"]).unwrap();
-        assert_eq!(cli.tools, Some(ToolsCliMode::Rw));
+    fn test_files_flag_explicit_write() {
+        let cli = Cli::try_parse_from(["zo", "--files", "write", "hello"]).unwrap();
+        assert_eq!(cli.files, Some(FileCliAccess::Write));
         assert_eq!(cli.args, vec!["hello"]);
     }
 
     #[test]
-    fn test_tools_flag_absent() {
+    fn test_files_flag_absent() {
         let cli = Cli::try_parse_from(["zo", "hello"]).unwrap();
-        assert_eq!(cli.tools, None);
+        assert_eq!(cli.files, None);
     }
 
     #[test]
-    fn test_tools_flag_invalid_mode() {
-        let result = Cli::try_parse_from(["zo", "--tools invalid", "hello"]);
+    fn test_files_flag_invalid_mode() {
+        let result = Cli::try_parse_from(["zo", "--files", "invalid", "hello"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_shell_flag_composes_with_files() {
+        let cli = Cli::try_parse_from(["zo", "--files", "read", "--shell", "hello"]).unwrap();
+        assert_eq!(cli.files, Some(FileCliAccess::Read));
+        assert!(cli.shell);
+    }
+
+    #[test]
+    fn test_accept_writes_flag_present() {
+        let cli = Cli::try_parse_from(["zo", "--accept-writes", "hello"]).unwrap();
+        assert!(cli.accept_writes);
+    }
+
+    #[test]
+    fn test_non_interactive_conflicts_with_debug() {
+        let result = Cli::try_parse_from(["zo", "--debug", "--non-interactive", "hello"]);
         assert!(result.is_err());
     }
 
@@ -675,34 +768,48 @@ mod tests {
     }
 
     #[test]
-    fn test_image_requires_output() {
-        let result = Cli::try_parse_from(["zo", "--image", "hello"]);
+    fn test_image_requires_output_path() {
+        let result = Cli::try_parse_from(["zo", "--image"]);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_output_requires_image() {
+    fn test_output_flag_is_removed() {
         let result = Cli::try_parse_from(["zo", "--output", "out.png", "hello"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_image_conflicts_with_chat() {
-        let result = Cli::try_parse_from(["zo", "--image", "--chat", "-o", "out.png", "hello"]);
+        let result = Cli::try_parse_from(["zo", "--chat", "--image", "out.png", "hello"]);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_image_conflicts_with_tools() {
-        let result =
-            Cli::try_parse_from(["zo", "--image", "--tools", "ro", "-o", "out.png", "hello"]);
+    fn test_image_conflicts_with_files() {
+        let result = Cli::try_parse_from(["zo", "--files", "read", "--image", "out.png", "hello"]);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_image_output_flag_parses() {
-        let cli = Cli::try_parse_from(["zo", "--image", "-o", "out.png", "hello"]).unwrap();
-        assert!(cli.image);
-        assert_eq!(cli.output.as_deref(), Some("out.png"));
+    fn test_image_conflicts_with_shell() {
+        let result = Cli::try_parse_from(["zo", "--shell", "--image", "out.png", "hello"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_image_flag_parses_output_path() {
+        let cli = Cli::try_parse_from(["zo", "--image", "out.png", "hello"]).unwrap();
+        assert_eq!(cli.image.as_deref(), Some("out.png"));
+        assert_eq!(cli.args, vec!["hello"]);
+    }
+
+    #[test]
+    fn test_image_flag_parses_output_path_with_following_option() {
+        let cli =
+            Cli::try_parse_from(["zo", "--image", "out.png", "--accept-writes", "hello"]).unwrap();
+        assert_eq!(cli.image.as_deref(), Some("out.png"));
+        assert!(cli.accept_writes);
+        assert_eq!(cli.args, vec!["hello"]);
     }
 }

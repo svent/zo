@@ -30,6 +30,7 @@ pub fn create_client(config: &Config) -> Result<OpenRouterClient> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ShellConfig;
 
     #[test]
     fn test_create_client_no_api_key() {
@@ -46,6 +47,7 @@ mod tests {
             theme: None,
             inline_colors: None,
             history_file: None,
+            shell: ShellConfig::default(),
         };
 
         let result = create_client(&config);

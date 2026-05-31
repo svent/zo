@@ -14,7 +14,8 @@ use crate::input::parse_file_patterns;
 use crate::models::ModelEntry;
 use crate::readline::ChatReadline;
 use crate::session::{Session, build_user_message};
-use crate::tools::ToolMode;
+use crate::shell::ShellRuntime;
+use crate::tools::ToolAccess;
 
 /// Configuration for starting a chat session.
 #[derive(Debug, Clone)]
@@ -23,16 +24,20 @@ pub struct ChatSessionOptions {
     pub initial_prompt: String,
     /// Optional STDIN content to include in first message
     pub initial_stdin: Option<String>,
-    /// Whether to auto-approve file changes
-    pub auto_approve: bool,
+    /// Whether to auto-approve file overwrites and edits
+    pub accept_writes: bool,
     /// Theme for markdown rendering
     pub theme_name: String,
     /// Colors for inline markdown
     pub inline_colors: InlineColors,
     /// Optional path to history file for persistence
     pub history_file: Option<String>,
-    /// Tool mode for this chat session
-    pub tool_mode: ToolMode,
+    /// Tool access for this chat session
+    pub tool_access: ToolAccess,
+    /// Optional shell runtime for this chat session
+    pub shell_runtime: Option<ShellRuntime>,
+    /// Whether confirmation prompts should be suppressed
+    pub non_interactive: bool,
     /// Whether hidden files/directories are accessible to tools
     pub allow_hidden: bool,
     /// Whether to log model-requested tool calls during execution
@@ -76,10 +81,12 @@ pub async fn run_chat_session(
         client,
         model_entry,
         output_files.clone(),
-        options.auto_approve,
+        options.accept_writes,
         options.theme_name.clone(),
         options.inline_colors.clone(),
-        options.tool_mode,
+        options.tool_access,
+        options.shell_runtime.clone(),
+        options.non_interactive,
         options.allow_hidden,
         options.show_tool_calls,
         options.show_full_tool_args,
@@ -102,13 +109,16 @@ pub async fn run_chat_session(
                 // Response already displayed during streaming
             }
             Err(e) => {
+                if options.non_interactive {
+                    return Err(e).context("Initial chat request failed");
+                }
                 eprintln!("\nError: {}", e);
-                eprintln!("Would you like to retry? (y/n): ");
+                eprintln!("Would you like to retry? [Y/n]: ");
                 io::stdout().flush()?;
 
                 let retry = read_retry_response()?;
 
-                if !retry.trim().eq_ignore_ascii_case("y") {
+                if !is_confirmation_approved(&retry) {
                     return Ok(()); // Exit chat
                 }
                 // Retry happens naturally on next loop iteration
@@ -150,13 +160,16 @@ pub async fn run_chat_session(
                         // Response already displayed during streaming
                     }
                     Err(e) => {
+                        if options.non_interactive {
+                            return Err(e).context("Chat request failed");
+                        }
                         eprintln!("\nError: {}", e);
-                        eprintln!("Would you like to retry? (y/n): ");
+                        eprintln!("Would you like to retry? [Y/n]: ");
                         io::stdout().flush()?;
 
                         let retry = read_retry_response()?;
 
-                        if retry.trim().eq_ignore_ascii_case("y") {
+                        if is_confirmation_approved(&retry) {
                             continue; // Retry the same request
                         } else {
                             break; // Exit chat
@@ -194,4 +207,27 @@ fn read_retry_response() -> Result<String> {
 
     io::stdin().read_line(&mut response)?;
     Ok(response)
+}
+
+fn is_confirmation_approved(response: &str) -> bool {
+    let response = response.trim();
+    response.is_empty()
+        || response.eq_ignore_ascii_case("y")
+        || response.eq_ignore_ascii_case("yes")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_confirmation_approved;
+
+    #[test]
+    fn test_confirmation_defaults_to_yes() {
+        assert!(is_confirmation_approved(""));
+        assert!(is_confirmation_approved("y"));
+        assert!(is_confirmation_approved("yes"));
+        assert!(is_confirmation_approved(" Y "));
+        assert!(!is_confirmation_approved("n"));
+        assert!(!is_confirmation_approved("no"));
+        assert!(!is_confirmation_approved("anything else"));
+    }
 }
