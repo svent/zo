@@ -1,5 +1,41 @@
 # Changelog
 
+## [0.4.0]
+
+### Added
+- Shell execution tools with `run_program` and `run_shell_command`
+- Configurable shell security policies with `allow`, `ask`, and `deny` actions, including program, argument, command-glob, and command-regex matching
+- `--files <read|write>`, `--shell`, and `--policies` CLI flags for independently enabling file and shell tool access
+- `--non-interactive` mode to suppress approval prompts and deny approval-required actions automatically
+- `--accept-writes` flag to auto-approve file overwrites and edits
+- Image generation mode with `--image <FILE>`
+- Binary output support via validated image file writing for generated images
+- Automatic image modality derivation from model capabilities, with a built-in image-capable fallback model
+- Stable `session_id` attached to API requests and reused across a session
+- Shell configuration section in config with allowed shells, always-on rules, and named policy sets
+- Approval prompt suggestions for durable shell policy rules
+
+### Changed
+- Replaced `--tools ro|rw` with separate `--files` and `--shell` controls
+- Renamed `--yes` to `--accept-writes`
+- Chat/session flow now supports shell runtime integration and non-interactive behavior
+- Default text model updated from `openai/gpt-5.3-codex` to `openai/gpt-5.4`
+- Default model aliases updated, including newer Gemini and Grok mappings and a built-in image alias
+- Model alias configuration now extends built-ins by default, supports overriding built-in aliases, and allows disabling built-in aliases with empty values
+- Model resolution refactored into separate text and image paths with more robust built-in fallback behavior
+- Config initialization now renders dynamically from model constants and includes richer examples and shell policy documentation
+- Confirmation prompts now default to yes (`[Y/n]`) for retries, file overwrites, and edits
+- Diff rendering now uses grouped hunks with context headers and preserves missing-newline hints
+- Debug output expanded to show file/shell tool access, active shell policies, overwrite approval mode, and interactive confirmation state
+- System prompt generation now includes shell-tool instructions when shell access is enabled
+
+### Improved
+- More stable fuzzy model matching with deterministic ordering and clearer precedence between custom, built-in, and added aliases
+- Better handling of hidden paths and workspace enforcement for shell cwd and binary output paths
+- Safer non-interactive behavior for initial requests, chat retries, file overwrites, and binary writes
+- Clearer config semantics and docs for built-in model aliases and shell execution
+- Image generation flow reuse through extracted `run_image_mode`
+
 ## [0.3.0]
 
 ### Added
