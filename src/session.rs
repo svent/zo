@@ -320,7 +320,8 @@ impl Session {
 
         let mut stream = self
             .client
-            .stream_chat_completion_tool_aware(request)
+            .chat()
+            .stream_tool_aware(request)
             .await
             .context("Failed to start streaming chat completion")?;
 

@@ -30,7 +30,8 @@ pub async fn derive_image_modalities(
     }
 
     let user_models = client
-        .list_models_for_user()
+        .models()
+        .list_user_models()
         .await
         .context("Failed to inspect image model capabilities via OpenRouter /models/user")?;
 
@@ -44,6 +45,7 @@ pub fn format_modalities(modalities: &[Modality]) -> String {
             Modality::Text => "text",
             Modality::Image => "image",
             Modality::Audio => "audio",
+            _ => "unknown",
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -60,7 +62,8 @@ pub async fn run_image_generation(
         .context("Failed to build image generation request")?;
 
     let response = client
-        .send_chat_completion(&request)
+        .chat()
+        .create(&request)
         .await
         .context("Failed to send image generation request")?;
 
