@@ -34,6 +34,8 @@ pub struct ChatSessionOptions {
     pub history_file: Option<String>,
     /// Tool access for this chat session
     pub tool_access: ToolAccess,
+    /// Whether to enable OpenRouter server-side web search
+    pub web_search: bool,
     /// Optional shell runtime for this chat session
     pub shell_runtime: Option<ShellRuntime>,
     /// Whether confirmation prompts should be suppressed
@@ -85,6 +87,7 @@ pub async fn run_chat_session(
         options.theme_name.clone(),
         options.inline_colors.clone(),
         options.tool_access,
+        options.web_search,
         options.shell_runtime.clone(),
         options.non_interactive,
         options.allow_hidden,

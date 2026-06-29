@@ -17,6 +17,10 @@ pub struct Config {
     /// Default model to use when none specified
     pub default_model: Option<String>,
 
+    /// Enable OpenRouter server-side web search by default
+    #[serde(default)]
+    pub web: bool,
+
     /// Model mappings (shortname -> OpenRouter model ID)
     /// Adds new aliases, overrides built-in aliases, or disables built-in aliases with ""
     #[serde(default)]
@@ -526,6 +530,7 @@ pub fn get_default_config() -> Config {
     Config {
         api_key: None,
         default_model: Some(DEFAULT_TEXT_MODEL_NAME.to_string()),
+        web: false,
         models: None,
         custom_models: Vec::new(),
         theme: Some("base16-ocean.dark".to_string()),
@@ -561,6 +566,10 @@ fn render_init_config_content() -> String {
 # This will be used if you don't provide a /model command or --model flag
 # Use short names like "codex", "sonnet", "flash", "gpt4o", etc.
 default_model = "{default_model}"
+
+# Enable OpenRouter server-side web search for text and chat requests
+# You can also enable this per request with --web.
+web = false
 
 # Chat history file path (uncomment to enable history persistence)
 # When set, chat history will be saved and restored between sessions
@@ -665,6 +674,7 @@ mod tests {
         let config = Config {
             api_key: Some("test-key".to_string()),
             default_model: Some("codex".to_string()),
+            web: false,
             models: None,
             custom_models: vec![
                 CustomModel {
@@ -688,10 +698,25 @@ mod tests {
     }
 
     #[test]
+    fn test_web_defaults_false_when_missing() {
+        let config: Config = toml::from_str(r#"default_model = "codex""#).unwrap();
+
+        assert!(!config.web);
+    }
+
+    #[test]
+    fn test_web_can_be_enabled_from_config() {
+        let config: Config = toml::from_str("web = true").unwrap();
+
+        assert!(config.web);
+    }
+
+    #[test]
     fn test_validate_config_empty_model_name() {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: None,
             custom_models: vec![CustomModel {
                 name: "".to_string(),
@@ -714,6 +739,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: None,
             custom_models: vec![CustomModel {
                 name: "mymodel".to_string(),
@@ -736,6 +762,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: None,
             custom_models: vec![
                 CustomModel {
@@ -765,6 +792,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: Some(std::collections::HashMap::from([(
                 "sonnet".to_string(),
                 "".to_string(),
@@ -785,6 +813,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: Some(std::collections::HashMap::from([(
                 "myalias".to_string(),
                 "".to_string(),
@@ -811,6 +840,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: None,
             custom_models: vec![],
             theme: Some("base16-ocean.dark".to_string()),
@@ -828,6 +858,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: None,
             custom_models: vec![],
             theme: Some("nonexistent-theme".to_string()),
@@ -846,6 +877,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: None,
             custom_models: vec![],
             theme: None,
@@ -868,6 +900,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: None,
             custom_models: vec![],
             theme: None,
@@ -893,6 +926,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: None,
             custom_models: vec![],
             theme: None,
@@ -918,6 +952,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: None,
             custom_models: vec![],
             theme: None,
@@ -969,6 +1004,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: None,
             custom_models: vec![],
             theme: None,
@@ -1023,6 +1059,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: None,
             custom_models: vec![],
             theme: None,
@@ -1054,6 +1091,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: None,
             custom_models: vec![],
             theme: None,
@@ -1096,6 +1134,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: None,
             custom_models: vec![],
             theme: None,
@@ -1134,6 +1173,7 @@ mod tests {
         let content = render_init_config_content();
 
         assert!(content.contains(&format!("default_model = \"{}\"", DEFAULT_TEXT_MODEL_NAME)));
+        assert!(content.contains("web = false"));
     }
 
     #[test]

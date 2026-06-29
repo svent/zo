@@ -90,6 +90,10 @@ struct Cli {
     #[arg(long)]
     shell: bool,
 
+    /// Enable OpenRouter server-side web search
+    #[arg(long, conflicts_with = "image")]
+    web: bool,
+
     /// Activate named shell policy sets (comma-separated)
     #[arg(long, value_delimiter = ',')]
     policies: Vec<String>,
@@ -201,6 +205,7 @@ fn display_debug_info(
     accept_writes: bool,
     non_interactive: bool,
     allow_hidden: bool,
+    web_search: bool,
 ) {
     println!("=== DEBUG MODE ===\n");
 
@@ -309,6 +314,10 @@ fn display_debug_info(
         } else {
             "blocked by default"
         }
+    );
+    println!(
+        "  web search: {}",
+        if web_search { "enabled" } else { "disabled" }
     );
 
     println!("\n==================\n");
@@ -520,6 +529,7 @@ async fn main() -> Result<()> {
         return run_image_mode(&cli, &config, parsed_input, model_override).await;
     }
 
+    let web_search = cli.web || config.web;
     let tool_access = ToolAccess::from_cli(cli.files, cli.shell);
     if !cli.shell && !cli.policies.is_empty() {
         bail!("--policies requires --shell");
@@ -560,6 +570,7 @@ async fn main() -> Result<()> {
             cli.accept_writes,
             cli.non_interactive,
             cli.hidden,
+            web_search,
         );
 
         if !ask_for_confirmation()? {
@@ -594,6 +605,7 @@ async fn main() -> Result<()> {
                 inline_colors,
                 history_file: config.history_file,
                 tool_access,
+                web_search,
                 shell_runtime: shell_runtime.clone(),
                 non_interactive: cli.non_interactive,
                 allow_hidden: cli.hidden,
@@ -633,6 +645,7 @@ async fn main() -> Result<()> {
             theme_name.to_string(),
             inline_colors,
             tool_access,
+            web_search,
             shell_runtime.clone(),
             cli.non_interactive,
             cli.hidden,
@@ -660,6 +673,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: Some(std::collections::HashMap::new()),
             custom_models: Vec::new(),
             theme: None,
@@ -680,6 +694,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: Some("mydefault".to_string()),
+            web: false,
             models: Some(std::collections::HashMap::from([(
                 "mydefault".to_string(),
                 "provider/custom-model".to_string(),
@@ -749,6 +764,12 @@ mod tests {
     }
 
     #[test]
+    fn test_web_flag_present() {
+        let cli = Cli::try_parse_from(["zo", "--web", "hello"]).unwrap();
+        assert!(cli.web);
+    }
+
+    #[test]
     fn test_debug_implies_tool_call_logging() {
         let cli = Cli::try_parse_from(["zo", "--debug", "hello"]).unwrap();
         let show_tool_calls = cli.debug || cli.verbose;
@@ -794,6 +815,12 @@ mod tests {
     #[test]
     fn test_image_conflicts_with_shell() {
         let result = Cli::try_parse_from(["zo", "--shell", "--image", "out.png", "hello"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_image_conflicts_with_web() {
+        let result = Cli::try_parse_from(["zo", "--web", "--image", "out.png", "hello"]);
         assert!(result.is_err());
     }
 

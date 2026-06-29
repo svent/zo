@@ -359,6 +359,7 @@ mod tests {
         Config {
             api_key: None,
             default_model: Some("google/gemini-2.0-flash-exp".to_string()),
+            web: false,
             models: None,
             custom_models: vec![CustomModel {
                 name: "mymodel".to_string(),
@@ -377,6 +378,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: None,
             custom_models: vec![],
             theme: None,
@@ -434,6 +436,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: None,
             custom_models: vec![CustomModel {
                 name: "sonnet".to_string(),
@@ -459,6 +462,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: None,
             custom_models: vec![],
             theme: None,
@@ -479,6 +483,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: None,
             custom_models: vec![],
             theme: None,
@@ -504,6 +509,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: None,
             custom_models: vec![],
             theme: None,
@@ -528,6 +534,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: None,
             custom_models: vec![],
             theme: None,
@@ -547,6 +554,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: None,
             custom_models: vec![],
             theme: None,
@@ -590,6 +598,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: None,
             custom_models: vec![],
             theme: None,
@@ -610,6 +619,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: None,
             custom_models: vec![],
             theme: None,
@@ -630,6 +640,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: None,
             custom_models: vec![],
             theme: None,
@@ -651,6 +662,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: None,
             custom_models: vec![CustomModel {
                 name: "mypro".to_string(),
@@ -677,6 +689,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: None,
             custom_models: vec![],
             theme: None,
@@ -714,6 +727,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: Some(custom_models),
             custom_models: vec![],
             theme: None,
@@ -762,6 +776,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: Some(base_models),
             custom_models: vec![CustomModel {
                 name: "coder".to_string(),
@@ -801,6 +816,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: Some(config_models),
             custom_models: vec![],
             theme: None,
@@ -827,6 +843,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: Some(config_models),
             custom_models: vec![],
             theme: None,
@@ -851,6 +868,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            web: false,
             models: Some(config_models),
             custom_models: vec![],
             theme: None,

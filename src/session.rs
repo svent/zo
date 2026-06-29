@@ -14,7 +14,7 @@ use openrouter_rs::api::chat::{ChatCompletionRequest, Message};
 use openrouter_rs::types::completion::FinishReason;
 use openrouter_rs::types::stream::StreamEvent;
 use openrouter_rs::types::typed_tool::TypedTool;
-use openrouter_rs::types::{Role, ToolCall};
+use openrouter_rs::types::{Role, ServerTool, ToolCall};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::io::{self, IsTerminal};
@@ -54,6 +54,8 @@ pub struct Session {
     inline_colors: InlineColors,
     /// Tool access capabilities
     tool_access: ToolAccess,
+    /// Whether to enable OpenRouter server-side web search
+    web_search: bool,
     /// Optional shell runtime when shell tools are enabled
     shell_runtime: Option<ShellRuntime>,
     /// Whether confirmation prompts should be suppressed
@@ -121,6 +123,7 @@ impl Session {
         theme_name: String,
         inline_colors: InlineColors,
         tool_access: ToolAccess,
+        web_search: bool,
         shell_runtime: Option<ShellRuntime>,
         non_interactive: bool,
         allow_hidden: bool,
@@ -137,6 +140,7 @@ impl Session {
             theme_name,
             inline_colors,
             tool_access,
+            web_search,
             shell_runtime,
             non_interactive,
             allow_hidden,
@@ -293,6 +297,10 @@ impl Session {
         if availability.shell_tools {
             builder.tool(RunProgramParams::create_tool());
             builder.tool(RunShellCommandParams::create_tool());
+        }
+
+        if self.web_search {
+            builder.server_tool(ServerTool::web_search());
         }
 
         builder
@@ -627,7 +635,12 @@ fn generate_session_id() -> String {
         .unwrap_or_default()
         .as_nanos();
 
-    format!("zo-{:x}-{:x}-{:x}", std::process::id(), timestamp_nanos, counter)
+    format!(
+        "zo-{:x}-{:x}-{:x}",
+        std::process::id(),
+        timestamp_nanos,
+        counter
+    )
 }
 
 fn truncate_with_suffix(input: &str, max_chars: usize) -> String {
@@ -711,6 +724,7 @@ mod tests {
                 file_mode: FileToolMode::Disabled,
                 shell_enabled: false,
             },
+            false,
             None,
             false,
             false,
@@ -869,6 +883,17 @@ mod tests {
 
         assert_eq!(json["session_id"], session.session_id);
         assert!(session.session_id.starts_with("zo-"));
+    }
+
+    #[test]
+    fn test_build_request_includes_web_search_tool_when_enabled() {
+        let mut session = test_session();
+        session.web_search = true;
+
+        let request = session.build_request().unwrap();
+        let json = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(json["tools"][0]["type"], "openrouter:web_search");
     }
 
     #[test]
