@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.5.0]
+
+### Added
+- OpenRouter server-side web search support via `--web`
+- `web` configuration option to enable server-side web search by default
+- Debug output now shows whether web search is enabled
+
+### Changed
+- Updated `openrouter-rs` to a newer API with namespaced client calls such as `.models()` and `.chat()`
+- `--web` is disallowed together with `--image` to keep image generation and web-enabled chat flows separate
+
+### Improved
+- Networking stack updated through the newer `openrouter-rs` release, including removal of the non-Windows vendored `openssl` dependency
+- Config initialization now includes the `web` setting and example documentation
+
 ## [0.4.0]
 
 ### Added
