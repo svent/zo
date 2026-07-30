@@ -43,6 +43,39 @@ pub struct Config {
     /// Shell execution defaults. Policy rules live in ~/.config/zo/policies/.
     #[serde(default)]
     pub shell: ShellConfig,
+
+    /// Safety limits for submitted input and retained conversation context.
+    #[serde(default)]
+    pub limits: LimitsConfig,
+}
+
+pub const DEFAULT_MAX_INPUT_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_MAX_SESSION_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LimitsConfig {
+    #[serde(default = "default_max_input_bytes")]
+    pub max_input_bytes: usize,
+    #[serde(default = "default_max_session_bytes")]
+    pub max_session_bytes: usize,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
+            max_session_bytes: DEFAULT_MAX_SESSION_BYTES,
+        }
+    }
+}
+
+fn default_max_input_bytes() -> usize {
+    DEFAULT_MAX_INPUT_BYTES
+}
+
+fn default_max_session_bytes() -> usize {
+    DEFAULT_MAX_SESSION_BYTES
 }
 
 /// Custom model definition
@@ -309,6 +342,13 @@ pub fn load_config() -> Result<Config> {
 /// - Inline color values are valid (if specified)
 /// - Shell policy configuration is valid (if specified)
 fn validate_config(config: &Config) -> Result<()> {
+    if config.limits.max_input_bytes == 0 {
+        anyhow::bail!("limits.max_input_bytes must be greater than zero");
+    }
+    if config.limits.max_session_bytes == 0 {
+        anyhow::bail!("limits.max_session_bytes must be greater than zero");
+    }
+
     if let Some(models) = &config.models {
         for (name, model_id) in models {
             if name.trim().is_empty() {
@@ -389,7 +429,7 @@ fn validate_config(config: &Config) -> Result<()> {
 ///
 /// Returns a config with:
 /// - No API key (must be provided via env var or config file)
-/// - Default model: "codex" (OpenAI Codex 5.3)
+/// - Default model: "codex" (OpenAI GPT-5.4)
 /// - No custom model mappings (uses built-in defaults)
 /// - Empty custom models list
 /// - Default theme: "base16-ocean.dark" (good for dark terminals)
@@ -405,6 +445,7 @@ pub fn get_default_config() -> Config {
         inline_colors: None,
         history_file: None, // History disabled by default
         shell: ShellConfig::default(),
+        limits: LimitsConfig::default(),
     }
 }
 
@@ -523,8 +564,15 @@ theme = "base16-ocean.dark"
 # name = "writer"
 # model = "openai/gpt-4o"
 # system_prompt = "You are a professional writer. Write clearly and engagingly."
+
+# Byte-based safety limits. These are not model token limits.
+[limits]
+max_input_bytes = {max_input_bytes}
+max_session_bytes = {max_session_bytes}
 "##,
         default_model = DEFAULT_TEXT_MODEL_NAME,
+        max_input_bytes = DEFAULT_MAX_INPUT_BYTES,
+        max_session_bytes = DEFAULT_MAX_SESSION_BYTES,
     )
 }
 
@@ -579,6 +627,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: LimitsConfig::default(),
         };
 
         assert!(validate_config(&config).is_ok());
@@ -599,6 +648,30 @@ mod tests {
     }
 
     #[test]
+    fn test_limits_default_when_missing() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.limits, LimitsConfig::default());
+    }
+
+    #[test]
+    fn test_validate_config_rejects_zero_limits() {
+        let mut config = get_default_config();
+        config.limits.max_input_bytes = 0;
+        assert!(validate_config(&config).is_err());
+
+        config.limits.max_input_bytes = DEFAULT_MAX_INPUT_BYTES;
+        config.limits.max_session_bytes = 0;
+        assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_rendered_config_contains_valid_limits() {
+        let content = render_init_config_content();
+        let config: Config = toml::from_str(&content).unwrap();
+        assert_eq!(config.limits, LimitsConfig::default());
+    }
+
+    #[test]
     fn test_validate_config_empty_model_name() {
         let config = Config {
             api_key: None,
@@ -614,6 +687,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: LimitsConfig::default(),
         };
 
         let result = validate_config(&config);
@@ -637,6 +711,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: LimitsConfig::default(),
         };
 
         let result = validate_config(&config);
@@ -667,6 +742,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: LimitsConfig::default(),
         };
 
         let result = validate_config(&config);
@@ -689,6 +765,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: LimitsConfig::default(),
         };
 
         let result = validate_config(&config);
@@ -710,6 +787,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: LimitsConfig::default(),
         };
 
         let result = validate_config(&config);
@@ -734,6 +812,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: LimitsConfig::default(),
         };
 
         let result = validate_config(&config);
@@ -752,6 +831,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: LimitsConfig::default(),
         };
 
         let result = validate_config(&config);
@@ -776,6 +856,7 @@ mod tests {
             }),
             history_file: None,
             shell: ShellConfig::default(),
+            limits: LimitsConfig::default(),
         };
 
         let result = validate_config(&config);
@@ -799,6 +880,7 @@ mod tests {
             }),
             history_file: None,
             shell: ShellConfig::default(),
+            limits: LimitsConfig::default(),
         };
 
         let result = validate_config(&config);
@@ -825,6 +907,7 @@ mod tests {
             }),
             history_file: None,
             shell: ShellConfig::default(),
+            limits: LimitsConfig::default(),
         };
 
         let result = validate_config(&config);
@@ -849,6 +932,7 @@ mod tests {
                 policy_sets: vec![toml::Value::Table(toml::map::Map::new())],
                 ..ShellConfig::default()
             },
+            limits: LimitsConfig::default(),
         };
 
         let result = validate_config(&config);

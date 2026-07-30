@@ -17,6 +17,8 @@ use openrouter_rs::types::typed_tool::TypedTool;
 use openrouter_rs::types::{Role, ServerTool, ToolCall};
 use serde_json::Value;
 use std::collections::HashSet;
+use std::error::Error;
+use std::fmt;
 use std::io::{self, IsTerminal};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -62,13 +64,56 @@ pub struct Session {
     non_interactive: bool,
     /// Whether hidden files/directories are accessible to tools
     allow_hidden: bool,
-    /// Whether to print tool calls requested by the model before executing them
-    show_tool_calls: bool,
-    /// Whether to show full tool arguments in logs (for debug mode)
-    show_full_tool_args: bool,
+    tool_log_mode: ToolLogMode,
+    max_session_bytes: usize,
+    pending_turn: bool,
+    retry_kind: Option<RetryKind>,
     /// Commands denied or rejected earlier in the session
     failed_shell_calls: HashSet<String>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolLogMode {
+    Off,
+    Compact,
+    Full,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionOptions {
+    pub output_files: Vec<OutputFileSpec>,
+    pub accept_writes: bool,
+    pub theme_name: String,
+    pub inline_colors: InlineColors,
+    pub tool_access: ToolAccess,
+    pub web_search: bool,
+    pub shell_runtime: Option<ShellRuntime>,
+    pub non_interactive: bool,
+    pub allow_hidden: bool,
+    pub tool_log_mode: ToolLogMode,
+    pub max_session_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryKind {
+    Stream,
+    PartialStream,
+    ToolContinuation,
+}
+
+#[derive(Debug)]
+struct StreamFailure {
+    message: String,
+    partial_output: bool,
+}
+
+impl fmt::Display for StreamFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Error for StreamFailure {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ToolAvailability {
@@ -115,43 +160,40 @@ impl Session {
     const TOOL_ARG_STRING_MAX_CHARS: usize = 180;
 
     /// Create a new session.
-    pub fn new(
-        client: OpenRouterClient,
-        model_entry: ModelEntry,
-        output_files: Vec<OutputFileSpec>,
-        accept_writes: bool,
-        theme_name: String,
-        inline_colors: InlineColors,
-        tool_access: ToolAccess,
-        web_search: bool,
-        shell_runtime: Option<ShellRuntime>,
-        non_interactive: bool,
-        allow_hidden: bool,
-        show_tool_calls: bool,
-        show_full_tool_args: bool,
-    ) -> Self {
+    pub fn new(client: OpenRouterClient, model_entry: ModelEntry, options: SessionOptions) -> Self {
         Session {
             messages: Vec::new(),
             session_id: generate_session_id(),
             model_entry,
             client,
-            output_files,
-            accept_writes,
-            theme_name,
-            inline_colors,
-            tool_access,
-            web_search,
-            shell_runtime,
-            non_interactive,
-            allow_hidden,
-            show_tool_calls,
-            show_full_tool_args,
+            output_files: options.output_files,
+            accept_writes: options.accept_writes,
+            theme_name: options.theme_name,
+            inline_colors: options.inline_colors,
+            tool_access: options.tool_access,
+            web_search: options.web_search,
+            shell_runtime: options.shell_runtime,
+            non_interactive: options.non_interactive,
+            allow_hidden: options.allow_hidden,
+            tool_log_mode: options.tool_log_mode,
+            max_session_bytes: options.max_session_bytes,
+            pending_turn: false,
+            retry_kind: None,
             failed_shell_calls: HashSet::new(),
         }
     }
 
     /// Send a user message and get the assistant's response.
     pub async fn send_message(&mut self, user_content: String) -> Result<String> {
+        self.begin_turn(user_content)?;
+        self.continue_pending_turn().await
+    }
+
+    fn begin_turn(&mut self, user_content: String) -> Result<()> {
+        if self.pending_turn {
+            anyhow::bail!("Cannot add a new message while the previous turn is pending");
+        }
+
         if self.messages.is_empty() {
             let system_prompt = self.build_system_prompt();
             if !system_prompt.is_empty() {
@@ -162,12 +204,42 @@ impl Session {
 
         self.messages
             .push(Message::new(Role::User, user_content.as_str()));
+        self.pending_turn = true;
+        Ok(())
+    }
+
+    pub async fn retry_pending(&mut self) -> Result<String> {
+        if !self.pending_turn {
+            anyhow::bail!("There is no pending turn to retry");
+        }
+        self.continue_pending_turn().await
+    }
+
+    pub fn retry_kind(&self) -> Option<RetryKind> {
+        self.retry_kind
+    }
+
+    async fn continue_pending_turn(&mut self) -> Result<String> {
+        self.retry_kind = None;
 
         let mut all_response_text = String::new();
 
-        for round in 0..Self::MAX_TOOL_ROUNDS {
+        for _round in 0..Self::MAX_TOOL_ROUNDS {
+            self.trim_context_to_limit()?;
             let request = self.build_request()?;
-            let (response_text, tool_calls) = self.stream_response(&request).await?;
+            let (response_text, tool_calls) = match self.stream_response(&request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    if let Some(stream_failure) = error.downcast_ref::<StreamFailure>() {
+                        self.retry_kind = Some(if stream_failure.partial_output {
+                            RetryKind::PartialStream
+                        } else {
+                            RetryKind::Stream
+                        });
+                    }
+                    return Err(error);
+                }
+            };
 
             if !response_text.is_empty() {
                 if !all_response_text.is_empty() {
@@ -179,7 +251,9 @@ impl Session {
             if tool_calls.is_empty() {
                 self.messages
                     .push(Message::new(Role::Assistant, response_text.as_str()));
-                break;
+                self.pending_turn = false;
+                self.retry_kind = None;
+                return Ok(all_response_text);
             }
 
             let assistant_content = if response_text.trim().is_empty() {
@@ -193,16 +267,13 @@ impl Session {
             ));
 
             self.execute_tool_calls(&tool_calls).await?;
-
-            if round + 1 >= Self::MAX_TOOL_ROUNDS {
-                eprintln!(
-                    "Warning: reached maximum tool call rounds ({}), stopping",
-                    Self::MAX_TOOL_ROUNDS
-                );
-            }
         }
 
-        Ok(all_response_text)
+        self.retry_kind = Some(RetryKind::ToolContinuation);
+        anyhow::bail!(
+            "Reached the maximum of {} tool-call rounds; the turn can be continued",
+            Self::MAX_TOOL_ROUNDS
+        )
     }
 
     /// Add new output files to the allowed list.
@@ -226,11 +297,11 @@ impl Session {
             return;
         }
 
-        if let Some(first_msg) = self.messages.first_mut() {
-            if matches!(first_msg.role, Role::System) {
-                *first_msg = Message::new(Role::System, new_system.as_str());
-                return;
-            }
+        if let Some(first_msg) = self.messages.first_mut()
+            && matches!(first_msg.role, Role::System)
+        {
+            *first_msg = Message::new(Role::System, new_system.as_str());
+            return;
         }
 
         self.messages
@@ -266,6 +337,58 @@ impl Session {
             .collect()
     }
 
+    fn trim_context_to_limit(&mut self) -> Result<()> {
+        let mut serialized_bytes = serde_json::to_vec(&self.messages)
+            .context("Failed to measure conversation context")?
+            .len();
+        if serialized_bytes <= self.max_session_bytes {
+            return Ok(());
+        }
+
+        let original_bytes = serialized_bytes;
+        let mut removed_turns = 0;
+
+        while serialized_bytes > self.max_session_bytes {
+            let Some(first_user) = self
+                .messages
+                .iter()
+                .position(|message| matches!(message.role, Role::User))
+            else {
+                break;
+            };
+            let Some(next_user_offset) = self.messages[first_user + 1..]
+                .iter()
+                .position(|message| matches!(message.role, Role::User))
+            else {
+                break;
+            };
+            let next_user = first_user + 1 + next_user_offset;
+            self.messages.drain(first_user..next_user);
+            removed_turns += 1;
+            serialized_bytes = serde_json::to_vec(&self.messages)
+                .context("Failed to measure conversation context")?
+                .len();
+        }
+
+        if removed_turns > 0 {
+            eprintln!(
+                "Warning: removed {} old conversation turn(s) ({} bytes) to fit the session limit",
+                removed_turns,
+                original_bytes.saturating_sub(serialized_bytes)
+            );
+        }
+
+        if serialized_bytes > self.max_session_bytes {
+            anyhow::bail!(
+                "The current turn requires {} serialized bytes, exceeding the {} byte session limit",
+                serialized_bytes,
+                self.max_session_bytes
+            );
+        }
+
+        Ok(())
+    }
+
     /// Build chat request from current message history.
     fn build_request(&self) -> Result<ChatCompletionRequest> {
         let availability = self.tool_availability();
@@ -274,8 +397,7 @@ impl Session {
         builder
             .model(&self.model_entry.model_id)
             .messages(self.messages.clone())
-            .session_id(&self.session_id)
-            .temperature(0.5);
+            .session_id(&self.session_id);
 
         if availability.read_tools {
             builder.tool(ListFilesParams::create_tool());
@@ -331,7 +453,14 @@ impl Session {
             .chat()
             .stream_tool_aware(request)
             .await
-            .context("Failed to start streaming chat completion")?;
+            .map_err(|error| {
+                anyhow::Error::new(StreamFailure {
+                    message: format!("Failed to start streaming chat completion: {}", error),
+                    partial_output: false,
+                })
+            })?;
+        let mut saw_done = false;
+        let mut stream_error = None;
 
         while let Some(event) = stream.next().await {
             match event {
@@ -364,6 +493,7 @@ impl Session {
                     finish_reason,
                     ..
                 } => {
+                    saw_done = true;
                     if matches!(finish_reason, Some(FinishReason::ToolCalls))
                         || !tool_calls.is_empty()
                     {
@@ -371,7 +501,8 @@ impl Session {
                     }
                 }
                 StreamEvent::Error(e) => {
-                    eprintln!("Stream error: {}", e);
+                    stream_error = Some(e.to_string());
+                    break;
                 }
                 _ => {
                     // ReasoningDelta, ReasoningDetailsDelta -- ignore for now
@@ -391,6 +522,19 @@ impl Session {
             .context("Failed to flush remaining content")?;
         if !accumulated_text.is_empty() {
             println!();
+        }
+
+        if let Some(error) = stream_error {
+            return Err(anyhow::Error::new(StreamFailure {
+                message: format!("Stream error: {}", error),
+                partial_output: !accumulated_text.is_empty(),
+            }));
+        }
+        if !saw_done {
+            return Err(anyhow::Error::new(StreamFailure {
+                message: "Stream ended before the completion marker".to_string(),
+                partial_output: !accumulated_text.is_empty(),
+            }));
         }
 
         Ok((accumulated_text, result_tool_calls))
@@ -440,7 +584,7 @@ impl Session {
     }
 
     fn log_tool_call(&self, tool_call: &ToolCall) {
-        if !self.show_tool_calls {
+        if self.tool_log_mode == ToolLogMode::Off {
             return;
         }
 
@@ -448,7 +592,7 @@ impl Session {
         let parsed_args = serde_json::from_str::<Value>(raw_args).ok();
 
         let compact_value = match parsed_args.as_ref() {
-            Some(value) if !self.show_full_tool_args => {
+            Some(value) if self.tool_log_mode != ToolLogMode::Full => {
                 truncate_json_strings(value, Self::TOOL_ARG_STRING_MAX_CHARS)
             }
             Some(value) => value.clone(),
@@ -463,17 +607,13 @@ impl Session {
             return;
         }
 
-        if self.show_full_tool_args {
-            if let Some(value) = parsed_args {
-                match serde_json::to_string_pretty(&value) {
-                    Ok(pretty) => {
-                        eprintln!("[tool] {} id={}", tool_call.name(), tool_call.id());
-                        eprintln!("[tool] args:\n{}", pretty);
-                        return;
-                    }
-                    Err(_) => {}
-                }
-            }
+        if self.tool_log_mode == ToolLogMode::Full
+            && let Some(value) = parsed_args
+            && let Ok(pretty) = serde_json::to_string_pretty(&value)
+        {
+            eprintln!("[tool] {} id={}", tool_call.name(), tool_call.id());
+            eprintln!("[tool] args:\n{}", pretty);
+            return;
         }
 
         let one_line_args = truncate_with_suffix(&compact_args, Self::TOOL_LOG_ONE_LINE_MAX_CHARS);
@@ -710,26 +850,32 @@ mod tests {
     use openrouter_rs::OpenRouterClient;
 
     fn test_session() -> Session {
+        test_session_with_client(OpenRouterClient::builder().build().unwrap())
+    }
+
+    fn test_session_with_client(client: OpenRouterClient) -> Session {
         Session::new(
-            OpenRouterClient::builder().build().unwrap(),
+            client,
             ModelEntry {
                 model_id: "openai/gpt-5.4".to_string(),
                 system_prompt: None,
             },
-            vec![],
-            false,
-            "base16-ocean.dark".to_string(),
-            InlineColors::default(),
-            ToolAccess {
-                file_mode: FileToolMode::Disabled,
-                shell_enabled: false,
+            SessionOptions {
+                output_files: vec![],
+                accept_writes: false,
+                theme_name: "base16-ocean.dark".to_string(),
+                inline_colors: InlineColors::default(),
+                tool_access: ToolAccess {
+                    file_mode: FileToolMode::Disabled,
+                    shell_enabled: false,
+                },
+                web_search: false,
+                shell_runtime: None,
+                non_interactive: false,
+                allow_hidden: false,
+                tool_log_mode: ToolLogMode::Off,
+                max_session_bytes: crate::config::DEFAULT_MAX_SESSION_BYTES,
             },
-            false,
-            None,
-            false,
-            false,
-            false,
-            false,
         )
     }
 
@@ -883,6 +1029,7 @@ mod tests {
 
         assert_eq!(json["session_id"], session.session_id);
         assert!(session.session_id.starts_with("zo-"));
+        assert!(json.get("temperature").is_none());
     }
 
     #[test]
@@ -909,5 +1056,82 @@ mod tests {
 
         assert_eq!(first_json["session_id"], second_json["session_id"]);
         assert_eq!(first_json["session_id"], session.session_id);
+    }
+
+    #[test]
+    fn test_pending_turn_is_added_once() {
+        let mut session = test_session();
+        session.begin_turn("hello".to_string()).unwrap();
+        assert!(session.pending_turn);
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .filter(|message| matches!(message.role, Role::User))
+                .count(),
+            1
+        );
+        assert!(session.begin_turn("duplicate".to_string()).is_err());
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .filter(|message| matches!(message.role, Role::User))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_failed_stream_retry_does_not_duplicate_user_message() {
+        let client = OpenRouterClient::builder()
+            .base_url("not a valid URL")
+            .api_key("test")
+            .build()
+            .unwrap();
+        let mut session = test_session_with_client(client);
+
+        assert!(session.send_message("hello".to_string()).await.is_err());
+        assert_eq!(session.retry_kind(), Some(RetryKind::Stream));
+        assert!(session.retry_pending().await.is_err());
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .filter(|message| matches!(message.role, Role::User))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_context_trimming_removes_complete_oldest_turn() {
+        let mut session = test_session();
+        session.messages = vec![
+            Message::new(Role::System, "system"),
+            Message::new(Role::User, "old user"),
+            Message::new(Role::Assistant, "x".repeat(1_000)),
+            Message::new(Role::User, "current user"),
+        ];
+        session.pending_turn = true;
+        session.max_session_bytes = 300;
+
+        session.trim_context_to_limit().unwrap();
+
+        assert_eq!(session.messages.len(), 2);
+        assert!(matches!(session.messages[0].role, Role::System));
+        assert!(matches!(session.messages[1].role, Role::User));
+        let json = serde_json::to_string(&session.messages).unwrap();
+        assert!(json.contains("current user"));
+        assert!(!json.contains("old user"));
+    }
+
+    #[test]
+    fn test_context_trimming_rejects_oversized_current_turn() {
+        let mut session = test_session();
+        session.messages = vec![Message::new(Role::User, "x".repeat(1_000))];
+        session.pending_turn = true;
+        session.max_session_bytes = 100;
+        assert!(session.trim_context_to_limit().is_err());
     }
 }

@@ -2,6 +2,8 @@ use crate::config::Config;
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use std::collections::HashMap;
+use std::error::Error;
+use std::fmt;
 
 /// Model entry containing model ID and optional system prompt
 #[derive(Debug, Clone)]
@@ -9,6 +11,43 @@ pub struct ModelEntry {
     pub model_id: String,
     pub system_prompt: Option<String>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelMatchKind {
+    ExactAlias,
+    DirectId,
+    SubstringAlias,
+    FuzzyAlias,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedModel {
+    pub canonical_alias: Option<String>,
+    pub entry: ModelEntry,
+    pub match_kind: ModelMatchKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelSelectionError {
+    NotFound(String),
+    Ambiguous { input: String, aliases: Vec<String> },
+}
+
+impl fmt::Display for ModelSelectionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound(input) => write!(f, "Model '{}' not found", input),
+            Self::Ambiguous { input, aliases } => write!(
+                f,
+                "Model '{}' is ambiguous; matching aliases: {}",
+                input,
+                aliases.join(", ")
+            ),
+        }
+    }
+}
+
+impl Error for ModelSelectionError {}
 
 pub const DEFAULT_TEXT_MODEL_NAME: &str = "codex";
 pub const DEFAULT_TEXT_MODEL_ID: &str = "openai/gpt-5.4";
@@ -167,13 +206,13 @@ pub fn build_model_map(config: &Config) -> HashMap<String, ModelEntry> {
 /// let entry = select_model("sonn", &map, &config);   // Matches "sonnet" via fuzzy
 /// let entry = select_model("sonnet", &map, &config); // Matches "sonnet" via exact
 /// ```
-pub fn select_model(
+pub fn resolve_model(
     input: &str,
     model_map: &HashMap<String, ModelEntry>,
     config: &Config,
-) -> Option<ModelEntry> {
+) -> Result<ResolvedModel, ModelSelectionError> {
     if is_disabled_builtin_alias(config, input) {
-        return None;
+        return Err(ModelSelectionError::NotFound(input.to_string()));
     }
 
     let base_models = resolve_base_models(config);
@@ -187,117 +226,154 @@ pub fn select_model(
     // Stage 1: Try exact match (case-insensitive)
     // Check custom models first
     for custom in &config.custom_models {
-        if check_exact(&custom.name) {
-            if let Some(entry) = model_map.get(&custom.name) {
-                return Some(entry.clone());
-            }
+        if check_exact(&custom.name)
+            && let Some(entry) = model_map.get(&custom.name)
+        {
+            return Ok(ResolvedModel {
+                canonical_alias: Some(custom.name.clone()),
+                entry: entry.clone(),
+                match_kind: ModelMatchKind::ExactAlias,
+            });
         }
     }
     // Then check built-in aliases and extra aliases from [models]
     for (name, _) in base_models.builtins.iter().chain(base_models.extras.iter()) {
-        if check_exact(name) {
-            if let Some(entry) = model_map.get(name) {
-                return Some(entry.clone());
-            }
+        if check_exact(name)
+            && let Some(entry) = model_map.get(name)
+        {
+            return Ok(ResolvedModel {
+                canonical_alias: Some(name.clone()),
+                entry: entry.clone(),
+                match_kind: ModelMatchKind::ExactAlias,
+            });
         }
+    }
+
+    if is_direct_model_id(input) {
+        return Ok(ResolvedModel {
+            canonical_alias: None,
+            entry: ModelEntry {
+                model_id: input.to_string(),
+                system_prompt: None,
+            },
+            match_kind: ModelMatchKind::DirectId,
+        });
     }
 
     // Stage 2: Try substring match (input is contained in model name)
     // Check custom models first
     for custom in &config.custom_models {
-        if check_substring(&custom.name) {
-            if let Some(entry) = model_map.get(&custom.name) {
-                return Some(entry.clone());
-            }
+        if check_substring(&custom.name)
+            && let Some(entry) = model_map.get(&custom.name)
+        {
+            return Ok(ResolvedModel {
+                canonical_alias: Some(custom.name.clone()),
+                entry: entry.clone(),
+                match_kind: ModelMatchKind::SubstringAlias,
+            });
         }
     }
     for (name, _) in &base_models.builtins {
-        if check_substring(name) {
-            if let Some(entry) = model_map.get(name) {
-                return Some(entry.clone());
-            }
+        if check_substring(name)
+            && let Some(entry) = model_map.get(name)
+        {
+            return Ok(ResolvedModel {
+                canonical_alias: Some(name.clone()),
+                entry: entry.clone(),
+                match_kind: ModelMatchKind::SubstringAlias,
+            });
         }
     }
     for (name, _) in &base_models.extras {
-        if check_substring(name) {
-            if let Some(entry) = model_map.get(name) {
-                return Some(entry.clone());
-            }
+        if check_substring(name)
+            && let Some(entry) = model_map.get(name)
+        {
+            return Ok(ResolvedModel {
+                canonical_alias: Some(name.clone()),
+                entry: entry.clone(),
+                match_kind: ModelMatchKind::SubstringAlias,
+            });
         }
     }
 
     // Stage 3: Try fuzzy matching - find best match across all models
     let matcher = SkimMatcherV2::default();
-    let mut best_custom_match: Option<(String, i64)> = None;
-    let mut best_builtin_match: Option<(String, i64)> = None;
-    let mut best_extra_match: Option<(String, i64)> = None;
-
-    // Check custom models
-    for custom in &config.custom_models {
-        if let Some(score) = matcher.fuzzy_match(&custom.name, input) {
-            if let Some((_, best_score)) = &best_custom_match {
-                if score > *best_score {
-                    best_custom_match = Some((custom.name.clone(), score));
-                }
-            } else {
-                best_custom_match = Some((custom.name.clone(), score));
-            }
-        }
-    }
-
-    for (name, _) in &base_models.builtins {
-        if let Some(score) = matcher.fuzzy_match(name, input) {
-            if let Some((_, best_score)) = &best_builtin_match {
-                if score > *best_score {
-                    best_builtin_match = Some((name.clone(), score));
-                }
-            } else {
-                best_builtin_match = Some((name.clone(), score));
-            }
-        }
-    }
-
-    for (name, _) in &base_models.extras {
-        if let Some(score) = matcher.fuzzy_match(name, input) {
-            if let Some((_, best_score)) = &best_extra_match {
-                if score > *best_score {
-                    best_extra_match = Some((name.clone(), score));
-                }
-            } else {
-                best_extra_match = Some((name.clone(), score));
-            }
-        }
-    }
-
-    // Lowered threshold from 60 to 50 to catch more valid partial matches
     const MIN_SCORE: i64 = 50;
 
-    // Prefer custom model match over base model match
-    if let Some((name, score)) = best_custom_match {
-        if score >= MIN_SCORE {
-            if let Some(entry) = model_map.get(&name) {
-                return Some(entry.clone());
-            }
+    let custom_names: Vec<String> = config
+        .custom_models
+        .iter()
+        .map(|m| m.name.clone())
+        .collect();
+    let builtin_names: Vec<String> = base_models
+        .builtins
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
+    let extra_names: Vec<String> = base_models.extras.iter().map(|(n, _)| n.clone()).collect();
+
+    for names in [&custom_names, &builtin_names, &extra_names] {
+        let mut scored: Vec<(String, i64)> = names
+            .iter()
+            .filter_map(|name| {
+                matcher
+                    .fuzzy_match(name, input)
+                    .map(|score| (name.clone(), score))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        let Some((_, best_score)) = scored.first() else {
+            continue;
+        };
+        if *best_score < MIN_SCORE {
+            continue;
+        }
+
+        let tied: Vec<String> = scored
+            .iter()
+            .take_while(|(_, score)| score == best_score)
+            .map(|(name, _)| name.clone())
+            .collect();
+        if tied.len() > 1 {
+            return Err(ModelSelectionError::Ambiguous {
+                input: input.to_string(),
+                aliases: tied,
+            });
+        }
+
+        let name = &scored[0].0;
+        if let Some(entry) = model_map.get(name) {
+            return Ok(ResolvedModel {
+                canonical_alias: Some(name.clone()),
+                entry: entry.clone(),
+                match_kind: ModelMatchKind::FuzzyAlias,
+            });
         }
     }
 
-    if let Some((name, score)) = best_builtin_match {
-        if score >= MIN_SCORE {
-            if let Some(entry) = model_map.get(&name) {
-                return Some(entry.clone());
-            }
-        }
-    }
+    Err(ModelSelectionError::NotFound(input.to_string()))
+}
 
-    if let Some((name, score)) = best_extra_match {
-        if score >= MIN_SCORE {
-            if let Some(entry) = model_map.get(&name) {
-                return Some(entry.clone());
-            }
-        }
-    }
+fn is_direct_model_id(input: &str) -> bool {
+    let Some((provider, model)) = input.split_once('/') else {
+        return false;
+    };
+    !provider.is_empty()
+        && !model.is_empty()
+        && !model.contains('/')
+        && !input.chars().any(char::is_whitespace)
+}
 
-    None
+#[cfg(test)]
+pub fn select_model(
+    input: &str,
+    model_map: &HashMap<String, ModelEntry>,
+    config: &Config,
+) -> Option<ModelEntry> {
+    resolve_model(input, model_map, config)
+        .ok()
+        .map(|resolved| resolved.entry)
 }
 
 /// Get top N fuzzy matches for a given input.
@@ -370,6 +446,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: crate::config::LimitsConfig::default(),
         }
     }
 
@@ -385,6 +462,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: crate::config::LimitsConfig::default(),
         };
 
         let model_map = build_model_map(&config);
@@ -447,6 +525,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: crate::config::LimitsConfig::default(),
         };
 
         let model_map = build_model_map(&config);
@@ -469,6 +548,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: crate::config::LimitsConfig::default(),
         };
         let model_map = build_model_map(&config);
 
@@ -476,6 +556,25 @@ mod tests {
         let result = select_model("sonnet", &model_map, &config);
         assert!(result.is_some());
         assert_eq!(result.unwrap().model_id, "anthropic/claude-sonnet-4.5");
+    }
+
+    #[test]
+    fn test_resolve_model_returns_canonical_alias() {
+        let config = create_test_config();
+        let model_map = build_model_map(&config);
+        let resolved = resolve_model("sonn", &model_map, &config).unwrap();
+        assert_eq!(resolved.canonical_alias.as_deref(), Some("sonnet"));
+        assert_eq!(resolved.match_kind, ModelMatchKind::SubstringAlias);
+    }
+
+    #[test]
+    fn test_resolve_model_accepts_direct_provider_id() {
+        let config = create_test_config();
+        let model_map = build_model_map(&config);
+        let resolved = resolve_model("provider/model", &model_map, &config).unwrap();
+        assert_eq!(resolved.canonical_alias, None);
+        assert_eq!(resolved.entry.model_id, "provider/model");
+        assert_eq!(resolved.match_kind, ModelMatchKind::DirectId);
     }
 
     #[test]
@@ -490,6 +589,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: crate::config::LimitsConfig::default(),
         };
         let model_map = build_model_map(&config);
 
@@ -516,6 +616,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: crate::config::LimitsConfig::default(),
         };
         let model_map = build_model_map(&config);
 
@@ -541,6 +642,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: crate::config::LimitsConfig::default(),
         };
         let model_map = build_model_map(&config);
 
@@ -561,6 +663,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: crate::config::LimitsConfig::default(),
         };
         let model_map = build_model_map(&config);
 
@@ -605,6 +708,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: crate::config::LimitsConfig::default(),
         };
         let model_map = build_model_map(&config);
 
@@ -626,6 +730,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: crate::config::LimitsConfig::default(),
         };
         let model_map = build_model_map(&config);
 
@@ -647,6 +752,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: crate::config::LimitsConfig::default(),
         };
         let model_map = build_model_map(&config);
 
@@ -673,6 +779,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: crate::config::LimitsConfig::default(),
         };
         let model_map = build_model_map(&config);
 
@@ -696,6 +803,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: crate::config::LimitsConfig::default(),
         };
         let model_map = build_model_map(&config);
 
@@ -734,6 +842,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: crate::config::LimitsConfig::default(),
         };
 
         let model_map = build_model_map(&config);
@@ -787,6 +896,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: crate::config::LimitsConfig::default(),
         };
 
         let model_map = build_model_map(&config);
@@ -823,6 +933,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: crate::config::LimitsConfig::default(),
         };
 
         let model_map = build_model_map(&config);
@@ -850,6 +961,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: crate::config::LimitsConfig::default(),
         };
 
         let model_map = build_model_map(&config);
@@ -859,7 +971,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_model_builtin_fuzzy_takes_precedence_over_added_alias() {
+    fn test_select_model_reports_builtin_fuzzy_tie() {
         use std::collections::HashMap;
 
         let mut config_models = HashMap::new();
@@ -875,6 +987,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: crate::config::LimitsConfig::default(),
         };
 
         let model_map = build_model_map(&config);
@@ -882,7 +995,7 @@ mod tests {
         assert!(matcher.fuzzy_match("sonnet", "sonet").is_some());
         assert!(matcher.fuzzy_match("sxonnet", "sonet").is_some());
 
-        let result = select_model("sonet", &model_map, &config).unwrap();
-        assert_eq!(result.model_id, "anthropic/claude-sonnet-4.5");
+        let error = resolve_model("sonet", &model_map, &config).unwrap_err();
+        assert!(matches!(error, ModelSelectionError::Ambiguous { .. }));
     }
 }

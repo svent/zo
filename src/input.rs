@@ -421,10 +421,31 @@ fn parse_all_file_patterns(input: &str) -> Result<UnifiedParseResult> {
 /// - "Create !output.txt" → marks output.txt for writing
 /// - "Update @!config.json" → reads config.json as input AND marks for output
 /// - "@*.rs review" → reads all .rs files, expands prompt
+#[cfg(test)]
 pub fn parse_file_patterns(
     input: &str,
 ) -> Result<(String, Vec<FileReference>, Vec<OutputFileSpec>)> {
+    parse_file_patterns_with_budget(input, usize::MAX, 0)
+}
+
+pub fn parse_file_patterns_limited(
+    input: &str,
+    max_input_bytes: usize,
+) -> Result<(String, Vec<FileReference>, Vec<OutputFileSpec>)> {
+    parse_file_patterns_with_budget(input, max_input_bytes, 0)
+}
+
+fn parse_file_patterns_with_budget(
+    input: &str,
+    max_input_bytes: usize,
+    already_used: usize,
+) -> Result<(String, Vec<FileReference>, Vec<OutputFileSpec>)> {
     let result = parse_all_file_patterns(input)?;
+
+    let mut used = already_used
+        .checked_add(result.modified_prompt.len())
+        .context("Input size overflow")?;
+    ensure_within_input_limit(used, max_input_bytes, "prompt")?;
 
     let mut parsed_files: Vec<(String, ParsedFilePattern)> = result.files.into_iter().collect();
     parsed_files.sort_by(|(left, _), (right, _)| left.cmp(right));
@@ -438,18 +459,19 @@ pub fn parse_file_patterns(
         // Build input file references (@ and @!)
         if pattern.syntax_type.is_input() {
             for filename in &pattern.resolved_files {
+                let remaining = max_input_bytes.saturating_sub(used);
                 let content = if pattern.syntax_type == FileSyntaxType::InputOutput {
                     // @! syntax - file might not exist yet
-                    read_file_if_exists(filename)?
+                    read_file_if_exists(filename, remaining, max_input_bytes)?
                 } else {
                     // @ syntax - file must exist
-                    fs::read_to_string(filename).with_context(|| {
-                        format!(
-                            "Could not read file '{}'. Make sure the file exists and is readable.",
-                            filename
-                        )
-                    })?
+                    read_utf8_limited(filename, remaining, max_input_bytes)?
                 };
+
+                used = used
+                    .checked_add(content.len())
+                    .context("Input size overflow")?;
+                ensure_within_input_limit(used, max_input_bytes, filename)?;
 
                 file_references.push(FileReference {
                     filename: filename.clone(),
@@ -495,15 +517,10 @@ fn extract_filename(chars: &[char]) -> Result<(String, usize)> {
 /// Read file if it exists, otherwise return empty string
 ///
 /// Used for @!file syntax where file might not exist yet
-fn read_file_if_exists(filename: &str) -> Result<String> {
+fn read_file_if_exists(filename: &str, remaining: usize, limit: usize) -> Result<String> {
     let path = Path::new(filename);
     if path.exists() {
-        fs::read_to_string(path).with_context(|| {
-            format!(
-                "Could not read file '{}'. Make sure the file is readable.",
-                filename
-            )
-        })
+        read_utf8_limited(filename, remaining, limit)
     } else {
         // File doesn't exist yet - return empty content
         Ok(String::new())
@@ -533,21 +550,32 @@ fn read_file_if_exists(filename: &str) -> Result<String> {
 /// // With STDIN (when piped): ["analyze"]
 /// // Result: ParsedInput { model_override: None, prompt: "analyze", stdin_content: Some("..."), file_references: [] }
 /// ```
+#[cfg(test)]
 pub fn parse_input(args: Vec<String>) -> Result<ParsedInput> {
-    let stdin_content = read_stdin_if_available().context("Failed to read from STDIN")?;
-    parse_input_with_stdin(args, stdin_content)
+    parse_input_limited(args, usize::MAX)
 }
 
-fn parse_input_with_stdin(args: Vec<String>, stdin_content: Option<String>) -> Result<ParsedInput> {
-    // Join args into single string
+pub fn parse_input_limited(args: Vec<String>, max_input_bytes: usize) -> Result<ParsedInput> {
     let joined = args.join(" ");
-
-    // Parse slash command if present
     let (model_override, prompt) = parse_slash_command(&joined);
+    let stdin_content = read_stdin_if_available_limited(
+        max_input_bytes.saturating_sub(prompt.len()),
+        max_input_bytes,
+    )
+    .context("Failed to read from STDIN")?;
+    parse_input_parts(model_override, prompt, stdin_content, max_input_bytes)
+}
 
-    // Parse all file patterns in a single pass (@ for input, ! for output, @! for both)
+fn parse_input_parts(
+    model_override: Option<String>,
+    prompt: String,
+    stdin_content: Option<String>,
+    max_input_bytes: usize,
+) -> Result<ParsedInput> {
+    let stdin_bytes = stdin_content.as_ref().map_or(0, String::len);
     let (final_prompt, file_references, output_files) =
-        parse_file_patterns(&prompt).context("Failed to parse file patterns")?;
+        parse_file_patterns_with_budget(&prompt, max_input_bytes, stdin_bytes)
+            .context("Failed to parse file patterns")?;
 
     Ok(ParsedInput {
         model_override,
@@ -562,11 +590,26 @@ fn parse_input_with_stdin(args: Vec<String>, stdin_content: Option<String>) -> R
 ///
 /// Image prompts keep slash-model overrides and piped STDIN behavior, but skip all
 /// `@file`, `!file`, and `@!file` parsing so prompt text stays literal.
-pub fn parse_image_input(args: Vec<String>) -> Result<ParsedInput> {
-    let stdin_content = read_stdin_if_available().context("Failed to read from STDIN")?;
-    parse_image_input_with_stdin(args, stdin_content)
+pub fn parse_image_input_limited(args: Vec<String>, max_input_bytes: usize) -> Result<ParsedInput> {
+    let joined = args.join(" ");
+    let (model_override, prompt) = parse_slash_command(&joined);
+    ensure_within_input_limit(prompt.len(), max_input_bytes, "prompt")?;
+    let stdin_content = read_stdin_if_available_limited(
+        max_input_bytes.saturating_sub(prompt.len()),
+        max_input_bytes,
+    )
+    .context("Failed to read from STDIN")?;
+
+    Ok(ParsedInput {
+        model_override,
+        prompt,
+        stdin_content,
+        file_references: Vec::new(),
+        output_files: Vec::new(),
+    })
 }
 
+#[cfg(test)]
 fn parse_image_input_with_stdin(
     args: Vec<String>,
     stdin_content: Option<String>,
@@ -618,7 +661,7 @@ fn parse_slash_command(input: &str) -> (Option<String>, String) {
 ///
 /// Returns None if STDIN is a terminal (interactive mode)
 /// Returns Some(content) if STDIN is piped
-fn read_stdin_if_available() -> Result<Option<String>> {
+fn read_stdin_if_available_limited(remaining: usize, limit: usize) -> Result<Option<String>> {
     let stdin = io::stdin();
 
     // Check if STDIN is a terminal (interactive) or a pipe
@@ -627,12 +670,7 @@ fn read_stdin_if_available() -> Result<Option<String>> {
         return Ok(None);
     }
 
-    // STDIN is piped, read all content
-    let mut buffer = String::new();
-    stdin
-        .lock()
-        .read_to_string(&mut buffer)
-        .context("Failed to read STDIN content")?;
+    let buffer = read_reader_limited(stdin.lock(), remaining, limit, "STDIN")?;
 
     // Return None if buffer is empty, otherwise return the content
     if buffer.trim().is_empty() {
@@ -642,9 +680,89 @@ fn read_stdin_if_available() -> Result<Option<String>> {
     }
 }
 
+fn read_utf8_limited(path: &str, remaining: usize, limit: usize) -> Result<String> {
+    let file = fs::File::open(path).with_context(|| {
+        format!(
+            "Could not read file '{}'. Make sure the file exists and is readable.",
+            path
+        )
+    })?;
+    read_reader_limited(file, remaining, limit, path)
+}
+
+fn read_reader_limited<R: Read>(
+    mut reader: R,
+    remaining: usize,
+    limit: usize,
+    source: &str,
+) -> Result<String> {
+    let mut bytes = Vec::new();
+    if remaining == usize::MAX {
+        reader.read_to_end(&mut bytes)?;
+    } else {
+        reader
+            .take(remaining.saturating_add(1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > remaining {
+            bail!(
+                "Input exceeds the {} byte limit while reading {}",
+                limit,
+                source
+            );
+        }
+    }
+    String::from_utf8(bytes).with_context(|| format!("{} is not valid UTF-8", source))
+}
+
+fn ensure_within_input_limit(used: usize, limit: usize, source: &str) -> Result<()> {
+    if used > limit {
+        bail!(
+            "Input exceeds the {} byte limit while processing {}",
+            limit,
+            source
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn test_bounded_reader_accepts_exact_limit() {
+        let value = read_reader_limited(Cursor::new("éé".as_bytes()), 4, 4, "test").unwrap();
+        assert_eq!(value, "éé");
+    }
+
+    #[test]
+    fn test_bounded_reader_rejects_limit_plus_one() {
+        let error = read_reader_limited(Cursor::new(b"abcde"), 4, 4, "test").unwrap_err();
+        assert!(error.to_string().contains("4 byte limit"));
+    }
+
+    #[test]
+    fn test_prompt_limit_counts_utf8_bytes() {
+        assert!(parse_file_patterns_limited("é", 2).is_ok());
+        assert!(parse_file_patterns_limited("é", 1).is_err());
+    }
+
+    #[test]
+    fn test_turn_limit_aggregates_prompt_and_stdin() {
+        let result = parse_input_parts(None, "é".to_string(), Some("abc".to_string()), 4);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_turn_limit_aggregates_referenced_files() {
+        let filename = "test_input_limit_aggregate.txt";
+        fs::write(filename, "data").unwrap();
+        let prompt = format!("@{} inspect", filename);
+        let result = parse_file_patterns_limited(&prompt, prompt.len() + 3);
+        fs::remove_file(filename).unwrap();
+        assert!(result.is_err());
+    }
 
     #[test]
     fn test_parse_slash_command_with_prompt() {

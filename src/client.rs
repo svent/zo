@@ -49,6 +49,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: crate::config::LimitsConfig::default(),
         };
 
         let result = create_client(&config);

@@ -23,7 +23,7 @@ mod tools;
 
 use config::Config;
 use input::ParsedInput;
-use models::ModelEntry;
+use models::{ModelEntry, ModelMatchKind, ResolvedModel};
 use shell::ShellRuntime;
 use tools::{FileCliAccess, FileToolMode, ToolAccess};
 
@@ -105,37 +105,100 @@ struct Cli {
     /// Allow tool access to hidden files/directories (dotfiles)
     #[arg(long)]
     hidden: bool,
+
+    /// Maximum aggregate bytes accepted for one submitted turn
+    #[arg(long, value_name = "BYTES")]
+    max_input_bytes: Option<usize>,
+
+    /// Maximum serialized conversation bytes retained for an API request
+    #[arg(long, value_name = "BYTES")]
+    max_session_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Action {
+    InitConfig,
+    ListModels,
+}
+
+fn parse_action(cli: &Cli) -> Result<Option<Action>> {
+    let Some(first) = cli.args.first() else {
+        return Ok(None);
+    };
+    if !first.starts_with('+') {
+        return Ok(None);
+    }
+
+    let action = match first.as_str() {
+        "+init-config" => Action::InitConfig,
+        "+list-models" => Action::ListModels,
+        unknown => bail!(
+            "Unknown action '{}'. Valid actions are +init-config and +list-models.",
+            unknown
+        ),
+    };
+
+    if cli.args.len() != 1
+        || cli.model.is_some()
+        || cli.debug
+        || cli.verbose
+        || cli.chat
+        || cli.image.is_some()
+        || cli.accept_writes
+        || cli.files.is_some()
+        || cli.shell
+        || cli.web
+        || !cli.policies.is_empty()
+        || cli.non_interactive
+        || cli.hidden
+        || cli.max_input_bytes.is_some()
+        || cli.max_session_bytes.is_some()
+    {
+        bail!("{} must be used as a standalone action", first);
+    }
+
+    Ok(Some(action))
 }
 
 /// Resolve a named model using aliases, config overrides, and fuzzy matching.
 ///
 /// Returns (model_name, model_entry) tuple so we can display the short name in debug mode
-fn resolve_named_model(model_name: String, config: &Config) -> Result<(String, ModelEntry)> {
+fn resolve_named_model(model_name: String, config: &Config) -> Result<ResolvedModel> {
     // Build model map from config and defaults
     let model_map = models::build_model_map(config);
 
     // Use fuzzy matching to find the model
-    if let Some(model_entry) = models::select_model(&model_name, &model_map, config) {
-        Ok((model_name, model_entry))
-    } else {
-        // Model not found - provide helpful error message
-        let available_models = models::list_model_names(&model_map);
-        let suggestions = models::get_fuzzy_matches(&model_name, &model_map, 3);
-
-        let mut error_msg = format!("Model '{}' not found.", model_name);
-
-        if !suggestions.is_empty() {
-            error_msg.push_str("\n\nDid you mean:");
-            for (name, model_id, score) in suggestions {
-                error_msg.push_str(&format!("\n  {} -> {} (score: {})", name, model_id, score));
+    match models::resolve_model(&model_name, &model_map, config) {
+        Ok(resolved) => Ok(resolved),
+        Err(models::ModelSelectionError::Ambiguous { aliases, .. }) => {
+            let mut error_msg = format!("Model '{}' is ambiguous. Matching aliases:", model_name);
+            for alias in aliases {
+                if let Some(entry) = model_map.get(&alias) {
+                    error_msg.push_str(&format!("\n  {} -> {}", alias, entry.model_id));
+                }
             }
+            bail!(error_msg)
         }
+        Err(models::ModelSelectionError::NotFound(_)) => {
+            // Model not found - provide helpful error message
+            let available_models = models::list_model_names(&model_map);
+            let suggestions = models::get_fuzzy_matches(&model_name, &model_map, 3);
 
-        error_msg.push_str("\n\nAvailable models:");
-        for name in available_models.iter() {
-            error_msg.push_str(&format!("\n  {}", name));
+            let mut error_msg = format!("Model '{}' not found.", model_name);
+
+            if !suggestions.is_empty() {
+                error_msg.push_str("\n\nDid you mean:");
+                for (name, model_id, score) in suggestions {
+                    error_msg.push_str(&format!("\n  {} -> {} (score: {})", name, model_id, score));
+                }
+            }
+
+            error_msg.push_str("\n\nAvailable models:");
+            for name in available_models.iter() {
+                error_msg.push_str(&format!("\n  {}", name));
+            }
+            bail!(error_msg);
         }
-        bail!(error_msg);
     }
 }
 
@@ -146,22 +209,20 @@ fn resolve_named_model(model_name: String, config: &Config) -> Result<(String, M
 /// 2. Slash command in prompt
 /// 3. Default model from config
 /// 4. Built-in fallback model
-fn resolve_text_model(
-    model_override: Option<String>,
-    config: &Config,
-) -> Result<(String, ModelEntry)> {
+fn resolve_text_model(model_override: Option<String>, config: &Config) -> Result<ResolvedModel> {
     if let Some(override_name) = model_override {
         resolve_named_model(override_name, config)
     } else if let Some(default_model) = &config.default_model {
         resolve_named_model(default_model.clone(), config)
     } else {
-        Ok((
-            models::DEFAULT_TEXT_MODEL_ID.to_string(),
-            ModelEntry {
+        Ok(ResolvedModel {
+            canonical_alias: None,
+            entry: ModelEntry {
                 model_id: models::DEFAULT_TEXT_MODEL_ID.to_string(),
                 system_prompt: None,
             },
-        ))
+            match_kind: ModelMatchKind::DirectId,
+        })
     }
 }
 
@@ -172,20 +233,48 @@ fn resolve_text_model(
 fn resolve_image_model(
     model_override: Option<String>,
     config: &Config,
-) -> Result<(String, ModelEntry, bool)> {
+) -> Result<(ResolvedModel, bool)> {
     if let Some(model_name) = model_override {
-        let (model_name, model_entry) = resolve_named_model(model_name, config)?;
-        Ok((model_name, model_entry, false))
+        Ok((resolve_named_model(model_name, config)?, false))
     } else {
         Ok((
-            image::DEFAULT_IMAGE_MODEL_ID.to_string(),
-            ModelEntry {
-                model_id: image::DEFAULT_IMAGE_MODEL_ID.to_string(),
-                system_prompt: None,
+            ResolvedModel {
+                canonical_alias: None,
+                entry: ModelEntry {
+                    model_id: image::DEFAULT_IMAGE_MODEL_ID.to_string(),
+                    system_prompt: None,
+                },
+                match_kind: ModelMatchKind::DirectId,
             },
             true,
         ))
     }
+}
+
+fn resolved_model_name(model: &ResolvedModel) -> &str {
+    model
+        .canonical_alias
+        .as_deref()
+        .unwrap_or(&model.entry.model_id)
+}
+
+fn display_verbose_model(model: &ResolvedModel) {
+    match model.match_kind {
+        ModelMatchKind::DirectId => eprintln!("Model: {}", model.entry.model_id),
+        _ => eprintln!(
+            "Model: {} -> {}",
+            model.canonical_alias.as_deref().unwrap_or("<unknown>"),
+            model.entry.model_id
+        ),
+    }
+}
+
+fn preview_text(input: &str, max_chars: usize) -> (String, usize) {
+    let total = input.chars().count();
+    if total <= max_chars {
+        return (input.to_string(), 0);
+    }
+    (input.chars().take(max_chars).collect(), total - max_chars)
 }
 
 /// Display debug information before sending request
@@ -246,8 +335,9 @@ fn display_debug_info(
     if let Some(stdin) = &parsed_input.stdin_content {
         println!("\nSTDIN Content:");
         // Show first 500 chars of STDIN to avoid overwhelming output
-        if stdin.len() > 500 {
-            println!("  {}... ({} more chars)", &stdin[..500], stdin.len() - 500);
+        let (preview, omitted) = preview_text(stdin, 500);
+        if omitted > 0 {
+            println!("  {}... ({} more chars)", preview, omitted);
         } else {
             println!("  {}", stdin);
         }
@@ -347,12 +437,9 @@ fn display_image_debug_info(
     println!("  {}", image::format_modalities(modalities));
 
     println!("\nPrompt Preview:");
-    if prompt.len() > 500 {
-        println!(
-            "  {}... ({} more chars)",
-            &prompt[..500],
-            prompt.len() - 500
-        );
+    let (preview, omitted) = preview_text(prompt, 500);
+    if omitted > 0 {
+        println!("  {}... ({} more chars)", preview, omitted);
     } else {
         println!("  {}", prompt);
     }
@@ -437,8 +524,10 @@ async fn run_image_mode(
         parsed_input.stdin_content.as_deref(),
     );
 
-    let (model_name, model_entry, using_default_image_model) =
+    let (resolved_model, using_default_image_model) =
         resolve_image_model(model_override, config).context("Failed to resolve image model")?;
+    let model_name = resolved_model_name(&resolved_model);
+    let model_entry = &resolved_model.entry;
 
     let client = client::create_client(config).context("Failed to create API client")?;
     let modalities =
@@ -448,8 +537,8 @@ async fn run_image_mode(
 
     if cli.debug {
         display_image_debug_info(
-            &model_name,
-            &model_entry,
+            model_name,
+            model_entry,
             &user_message,
             &output_path,
             &modalities,
@@ -465,7 +554,7 @@ async fn run_image_mode(
 
     image::run_image_generation(
         client,
-        model_entry,
+        resolved_model.entry,
         &user_message,
         modalities,
         image::ImageGenerationOptions {
@@ -484,22 +573,20 @@ async fn main() -> Result<()> {
     // Parse command-line arguments
     let cli = Cli::parse();
 
-    // Handle +actions first (must be first positional argument and start with '+')
-    // Available: +init-config, +list-models
-    if let Some(first_arg) = cli.args.get(0) {
-        if first_arg.starts_with("+init-config") {
-            return config::init_config();
-        }
-        if first_arg.starts_with("+list-models") {
-            let config = config::load_config().context("Failed to load configuration")?;
-            let model_map = models::build_model_map(&config);
-            println!("Available models:");
-            for name in models::list_model_names(&model_map) {
-                if let Some(entry) = model_map.get(&name) {
-                    println!("  {:<16} -> {}", name, entry.model_id);
+    if let Some(action) = parse_action(&cli)? {
+        match action {
+            Action::InitConfig => return config::init_config(),
+            Action::ListModels => {
+                let config = config::load_config().context("Failed to load configuration")?;
+                let model_map = models::build_model_map(&config);
+                println!("Configured model aliases:");
+                for name in models::list_model_names(&model_map) {
+                    if let Some(entry) = model_map.get(&name) {
+                        println!("  {:<16} -> {}", name, entry.model_id);
+                    }
                 }
+                return Ok(());
             }
-            return Ok(());
         }
     }
 
@@ -514,12 +601,24 @@ async fn main() -> Result<()> {
 
     // Load configuration
     let config = config::load_config().context("Failed to load configuration")?;
+    let max_input_bytes = cli.max_input_bytes.unwrap_or(config.limits.max_input_bytes);
+    let max_session_bytes = cli
+        .max_session_bytes
+        .unwrap_or(config.limits.max_session_bytes);
+    if max_input_bytes == 0 {
+        bail!("--max-input-bytes must be greater than zero");
+    }
+    if max_session_bytes == 0 {
+        bail!("--max-session-bytes must be greater than zero");
+    }
 
     // Parse input (args + STDIN)
     let parsed_input = if cli.image.is_some() {
-        input::parse_image_input(cli.args.clone()).context("Failed to parse image input")?
+        input::parse_image_input_limited(cli.args.clone(), max_input_bytes)
+            .context("Failed to parse image input")?
     } else {
-        input::parse_input(cli.args.clone()).context("Failed to parse input")?
+        input::parse_input_limited(cli.args.clone(), max_input_bytes)
+            .context("Failed to parse input")?
     };
 
     // Determine final model override (CLI flag takes precedence over slash command)
@@ -539,7 +638,13 @@ async fn main() -> Result<()> {
         bail!("Shell tools are only supported on Unix platforms in this version.");
     }
     let show_tool_calls = cli.debug || cli.verbose;
-    let show_full_tool_args = cli.debug;
+    let tool_log_mode = if cli.debug {
+        session::ToolLogMode::Full
+    } else if cli.verbose {
+        session::ToolLogMode::Compact
+    } else {
+        session::ToolLogMode::Off
+    };
 
     let shell_runtime = if tool_access.shell_enabled {
         let config_dir = config::get_config_dir().context("Failed to resolve config directory")?;
@@ -564,14 +669,20 @@ async fn main() -> Result<()> {
         .unwrap_or_default();
 
     // Resolve which model to use (with fuzzy matching)
-    let (model_name, model_entry) =
+    let resolved_model =
         resolve_text_model(model_override, &config).context("Failed to resolve model")?;
+    let model_name = resolved_model_name(&resolved_model);
+    let model_entry = &resolved_model.entry;
+
+    if cli.verbose && !cli.debug {
+        display_verbose_model(&resolved_model);
+    }
 
     // If debug mode is enabled, show diagnostic info and ask for confirmation
     if cli.debug {
         display_debug_info(
-            &model_name,
-            &model_entry,
+            model_name,
+            model_entry,
             &parsed_input,
             tool_access,
             &active_shell_policies,
@@ -604,21 +715,24 @@ async fn main() -> Result<()> {
         // Run interactive chat session
         chat::run_chat_session(
             client,
-            model_entry,
+            resolved_model.entry,
             chat::ChatSessionOptions {
-                initial_prompt: parsed_input.prompt,
-                initial_stdin: parsed_input.stdin_content,
-                accept_writes: cli.accept_writes,
-                theme_name: theme_name.to_string(),
-                inline_colors,
+                initial_input: parsed_input,
+                session: session::SessionOptions {
+                    output_files: Vec::new(),
+                    accept_writes: cli.accept_writes,
+                    theme_name: theme_name.to_string(),
+                    inline_colors,
+                    tool_access,
+                    web_search,
+                    shell_runtime: shell_runtime.clone(),
+                    non_interactive: cli.non_interactive,
+                    allow_hidden: cli.hidden,
+                    tool_log_mode,
+                    max_session_bytes,
+                },
                 history_file: config.history_file,
-                tool_access,
-                web_search,
-                shell_runtime: shell_runtime.clone(),
-                non_interactive: cli.non_interactive,
-                allow_hidden: cli.hidden,
-                show_tool_calls,
-                show_full_tool_args,
+                max_input_bytes,
             },
         )
         .await
@@ -647,18 +761,20 @@ async fn main() -> Result<()> {
         // Create session
         let mut session = session::Session::new(
             client,
-            model_entry,
-            parsed_input.output_files,
-            cli.accept_writes,
-            theme_name.to_string(),
-            inline_colors,
-            tool_access,
-            web_search,
-            shell_runtime.clone(),
-            cli.non_interactive,
-            cli.hidden,
-            show_tool_calls,
-            show_full_tool_args,
+            resolved_model.entry,
+            session::SessionOptions {
+                output_files: parsed_input.output_files,
+                accept_writes: cli.accept_writes,
+                theme_name: theme_name.to_string(),
+                inline_colors,
+                tool_access,
+                web_search,
+                shell_runtime: shell_runtime.clone(),
+                non_interactive: cli.non_interactive,
+                allow_hidden: cli.hidden,
+                tool_log_mode,
+                max_session_bytes,
+            },
         );
 
         // Send message and get response
@@ -688,13 +804,17 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: config::LimitsConfig::default(),
         };
 
-        let (model_name, model_entry) = resolve_text_model(None, &config).unwrap();
+        let resolved = resolve_text_model(None, &config).unwrap();
 
-        assert_eq!(model_name, models::DEFAULT_TEXT_MODEL_ID);
-        assert_eq!(model_entry.model_id, models::DEFAULT_TEXT_MODEL_ID);
-        assert_eq!(model_entry.system_prompt, None);
+        assert_eq!(
+            resolved_model_name(&resolved),
+            models::DEFAULT_TEXT_MODEL_ID
+        );
+        assert_eq!(resolved.entry.model_id, models::DEFAULT_TEXT_MODEL_ID);
+        assert_eq!(resolved.entry.system_prompt, None);
     }
 
     #[test]
@@ -712,12 +832,13 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: config::LimitsConfig::default(),
         };
 
-        let (model_name, model_entry) = resolve_text_model(None, &config).unwrap();
+        let resolved = resolve_text_model(None, &config).unwrap();
 
-        assert_eq!(model_name, "mydefault");
-        assert_eq!(model_entry.model_id, "provider/custom-model");
+        assert_eq!(resolved_model_name(&resolved), "mydefault");
+        assert_eq!(resolved.entry.model_id, "provider/custom-model");
     }
 
     #[test]
@@ -769,6 +890,45 @@ mod tests {
     fn test_verbose_flag_present() {
         let cli = Cli::try_parse_from(["zo", "--verbose", "hello"]).unwrap();
         assert!(cli.verbose);
+    }
+
+    #[test]
+    fn test_actions_require_exact_standalone_syntax() {
+        let list = Cli::try_parse_from(["zo", "+list-models"]).unwrap();
+        assert_eq!(parse_action(&list).unwrap(), Some(Action::ListModels));
+
+        let typo = Cli::try_parse_from(["zo", "+list-models-typo"]).unwrap();
+        assert!(parse_action(&typo).is_err());
+
+        let trailing = Cli::try_parse_from(["zo", "+init-config", "extra"]).unwrap();
+        assert!(parse_action(&trailing).is_err());
+
+        let flagged = Cli::try_parse_from(["zo", "--verbose", "+list-models"]).unwrap();
+        assert!(parse_action(&flagged).is_err());
+    }
+
+    #[test]
+    fn test_preview_text_is_unicode_safe() {
+        let input = format!("{}étail", "a".repeat(499));
+        let (preview, omitted) = preview_text(&input, 500);
+        assert_eq!(preview.chars().count(), 500);
+        assert!(preview.ends_with('é'));
+        assert_eq!(omitted, 4);
+    }
+
+    #[test]
+    fn test_limit_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "zo",
+            "--max-input-bytes",
+            "1024",
+            "--max-session-bytes",
+            "4096",
+            "hello",
+        ])
+        .unwrap();
+        assert_eq!(cli.max_input_bytes, Some(1024));
+        assert_eq!(cli.max_session_bytes, Some(4096));
     }
 
     #[test]

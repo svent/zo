@@ -9,43 +9,18 @@ use anyhow::{Context, Result};
 use openrouter_rs::OpenRouterClient;
 use std::io::{self, BufRead, Write};
 
-use crate::config::InlineColors;
-use crate::input::parse_file_patterns;
+use crate::input::{ParsedInput, parse_file_patterns_limited};
 use crate::models::ModelEntry;
 use crate::readline::ChatReadline;
-use crate::session::{Session, build_user_message};
-use crate::shell::ShellRuntime;
-use crate::tools::ToolAccess;
+use crate::session::{RetryKind, Session, SessionOptions, build_user_message};
 
 /// Configuration for starting a chat session.
 #[derive(Debug, Clone)]
 pub struct ChatSessionOptions {
-    /// Initial user prompt (can be empty if STDIN is provided)
-    pub initial_prompt: String,
-    /// Optional STDIN content to include in first message
-    pub initial_stdin: Option<String>,
-    /// Whether to auto-approve file overwrites and edits
-    pub accept_writes: bool,
-    /// Theme for markdown rendering
-    pub theme_name: String,
-    /// Colors for inline markdown
-    pub inline_colors: InlineColors,
-    /// Optional path to history file for persistence
+    pub initial_input: ParsedInput,
+    pub session: SessionOptions,
     pub history_file: Option<String>,
-    /// Tool access for this chat session
-    pub tool_access: ToolAccess,
-    /// Whether to enable OpenRouter server-side web search
-    pub web_search: bool,
-    /// Optional shell runtime for this chat session
-    pub shell_runtime: Option<ShellRuntime>,
-    /// Whether confirmation prompts should be suppressed
-    pub non_interactive: bool,
-    /// Whether hidden files/directories are accessible to tools
-    pub allow_hidden: bool,
-    /// Whether to log model-requested tool calls during execution
-    pub show_tool_calls: bool,
-    /// Whether to show full tool arguments in logs (debug mode)
-    pub show_full_tool_args: bool,
+    pub max_input_bytes: usize,
 }
 
 /// Run an interactive chat session
@@ -66,34 +41,20 @@ pub async fn run_chat_session(
     model_entry: ModelEntry,
     options: ChatSessionOptions,
 ) -> Result<()> {
-    // Parse all file patterns from initial prompt in a single pass
-    let (final_initial_prompt, initial_file_refs, output_files) =
-        parse_file_patterns(&options.initial_prompt)
-            .context("Failed to parse file patterns from initial prompt")?;
+    let mut session_options = options.session;
+    session_options.output_files = options.initial_input.output_files;
 
     // Build first message combining file references, prompt, and STDIN
     let first_message = build_user_message(
-        &initial_file_refs,
-        &final_initial_prompt,
-        options.initial_stdin.as_deref(),
+        &options.initial_input.file_references,
+        &options.initial_input.prompt,
+        options.initial_input.stdin_content.as_deref(),
     );
 
     // Create unified session
-    let mut session = Session::new(
-        client,
-        model_entry,
-        output_files.clone(),
-        options.accept_writes,
-        options.theme_name.clone(),
-        options.inline_colors.clone(),
-        options.tool_access,
-        options.web_search,
-        options.shell_runtime.clone(),
-        options.non_interactive,
-        options.allow_hidden,
-        options.show_tool_calls,
-        options.show_full_tool_args,
-    );
+    let non_interactive = session_options.non_interactive;
+    let prompt_color = session_options.inline_colors.get_prompt_color();
+    let mut session = Session::new(client, model_entry, session_options);
 
     // Create readline with optional history
     let mut readline = ChatReadline::new(options.history_file.as_deref())
@@ -111,20 +72,10 @@ pub async fn run_chat_session(
             Ok(_) => {
                 // Response already displayed during streaming
             }
-            Err(e) => {
-                if options.non_interactive {
-                    return Err(e).context("Initial chat request failed");
+            Err(error) => {
+                if !retry_pending_turn(&mut session, error, non_interactive).await? {
+                    return Ok(());
                 }
-                eprintln!("\nError: {}", e);
-                eprintln!("Would you like to retry? [Y/n]: ");
-                io::stdout().flush()?;
-
-                let retry = read_retry_response()?;
-
-                if !is_confirmation_approved(&retry) {
-                    return Ok(()); // Exit chat
-                }
-                // Retry happens naturally on next loop iteration
             }
         }
     }
@@ -132,7 +83,7 @@ pub async fn run_chat_session(
     // Main chat loop
     loop {
         // Prompt for next user input using readline
-        match readline.read_input(options.inline_colors.get_prompt_color()) {
+        match readline.read_input(prompt_color) {
             Ok(Some(input)) => {
                 if input.is_empty() {
                     println!("(Empty input ignored)");
@@ -141,7 +92,7 @@ pub async fn run_chat_session(
 
                 // Parse all file patterns from user input in a single pass
                 let (final_input_prompt, file_refs, new_output_files) =
-                    match parse_file_patterns(&input) {
+                    match parse_file_patterns_limited(&input, options.max_input_bytes) {
                         Ok(result) => result,
                         Err(e) => {
                             eprintln!("\nError parsing file patterns: {}", e);
@@ -162,20 +113,9 @@ pub async fn run_chat_session(
                     Ok(_) => {
                         // Response already displayed during streaming
                     }
-                    Err(e) => {
-                        if options.non_interactive {
-                            return Err(e).context("Chat request failed");
-                        }
-                        eprintln!("\nError: {}", e);
-                        eprintln!("Would you like to retry? [Y/n]: ");
-                        io::stdout().flush()?;
-
-                        let retry = read_retry_response()?;
-
-                        if is_confirmation_approved(&retry) {
-                            continue; // Retry the same request
-                        } else {
-                            break; // Exit chat
+                    Err(error) => {
+                        if !retry_pending_turn(&mut session, error, non_interactive).await? {
+                            break;
                         }
                     }
                 }
@@ -193,6 +133,42 @@ pub async fn run_chat_session(
     }
 
     Ok(())
+}
+
+async fn retry_pending_turn(
+    session: &mut Session,
+    mut error: anyhow::Error,
+    non_interactive: bool,
+) -> Result<bool> {
+    loop {
+        let retry_kind = session.retry_kind();
+        if non_interactive || retry_kind.is_none() {
+            return Err(error).context("Chat request failed");
+        }
+
+        eprintln!("\nError: {}", error);
+        let prompt = match retry_kind {
+            Some(RetryKind::PartialStream) => {
+                "Retry this turn? Some response text may be repeated. [Y/n]: "
+            }
+            Some(RetryKind::ToolContinuation) => {
+                "Continue this turn for another tool-call batch? [Y/n]: "
+            }
+            Some(RetryKind::Stream) => "Retry this turn? [Y/n]: ",
+            None => unreachable!(),
+        };
+        eprint!("{}", prompt);
+        io::stderr().flush()?;
+
+        if !is_confirmation_approved(&read_retry_response()?) {
+            return Ok(false);
+        }
+
+        match session.retry_pending().await {
+            Ok(_) => return Ok(true),
+            Err(next_error) => error = next_error,
+        }
+    }
 }
 
 fn read_retry_response() -> Result<String> {
