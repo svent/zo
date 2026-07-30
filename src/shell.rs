@@ -1,15 +1,14 @@
 use anyhow::{Context, Result, bail};
 use crossterm::ExecutableCommand;
 use crossterm::style::{Attribute, Print, ResetColor, SetAttribute, SetForegroundColor};
-use glob::Pattern;
 use openrouter_rs::types::typed_tool::TypedTool;
 use regex::Regex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fmt::Write as _;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, BufRead, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
@@ -18,9 +17,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
-use crate::config::{
-    InlineColors, ShellArgMatcher, ShellConfig, ShellPolicyAction, ShellPolicyEntry, ShellPolicySet,
-};
+use crate::config::{InlineColors, ShellConfig, ShellPolicyAction};
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TIMEOUT_MS: u64 = 120_000;
@@ -73,8 +70,51 @@ pub struct ShellRuntime {
     allowed_shells: Vec<String>,
     non_interactive: bool,
     show_verbose_approval_details: bool,
-    always_on: Vec<ShellPolicyEntry>,
-    selected_sets: Vec<ShellPolicySet>,
+    entries: Vec<ShellPolicyRule>,
+    active_policy_names: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShellPolicyRegistry {
+    policies: HashMap<String, ShellPolicy>,
+}
+
+#[derive(Debug, Clone)]
+struct ShellPolicy {
+    name: String,
+    path: PathBuf,
+    entries: Vec<ShellPolicyRule>,
+    tests: Vec<ShellPolicyTest>,
+}
+
+#[derive(Debug, Clone)]
+struct ShellPolicyRule {
+    action: ShellPolicyAction,
+    program: String,
+    args: Vec<ShellDslArgPattern>,
+}
+
+#[derive(Debug, Clone)]
+struct ShellPolicyTest {
+    line: usize,
+    expected: ShellPolicyTestExpectation,
+    command: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellPolicyTestExpectation {
+    Action(ShellPolicyAction),
+    Default,
+}
+
+#[derive(Debug, Clone)]
+enum ShellDslArgPattern {
+    Exact(String),
+    Regex { source: String, compiled: Regex },
+    AnyOne,
+    OptionalAny,
+    OneOrMore,
+    ZeroOrMore,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +156,7 @@ struct Rejection {
 struct PolicyDecision {
     action: ShellPolicyAction,
     reason: String,
+    used_default: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,30 +271,36 @@ struct ExecutionOutcome {
 }
 
 impl ShellRuntime {
-    pub fn new(
+    pub fn new_with_policy_registry(
         config: &ShellConfig,
-        active_policy_sets: &[String],
+        registry: &ShellPolicyRegistry,
+        active_policy_names: &[String],
         non_interactive: bool,
         show_verbose_approval_details: bool,
     ) -> Result<Self> {
-        let mut seen = HashSet::new();
-        let mut selected_sets = Vec::new();
+        let mut selected_names = Vec::new();
+        if active_policy_names.is_empty() {
+            if registry.get("default").is_some() {
+                selected_names.push("default".to_string());
+            }
+        } else {
+            selected_names.extend(active_policy_names.iter().cloned());
+        }
 
-        for set_name in active_policy_sets {
-            let normalized = set_name.to_ascii_lowercase();
+        let mut seen = HashSet::new();
+        let mut entries = Vec::new();
+        let mut active_display_names = Vec::new();
+        for name in &selected_names {
+            let normalized = normalize_policy_name(name);
             if !seen.insert(normalized.clone()) {
-                bail!("--policies contains duplicate set name '{}'", set_name);
+                bail!("--policies contains duplicate policy name '{}'", name);
             }
 
-            let Some(policy_set) = config
-                .policy_sets
-                .iter()
-                .find(|set| set.name.eq_ignore_ascii_case(set_name))
-            else {
-                bail!("Unknown shell policy set '{}'", set_name);
+            let Some(policy) = registry.get(name) else {
+                bail!("Unknown shell policy '{}'", name);
             };
-
-            selected_sets.push(policy_set.clone());
+            active_display_names.push(policy.name.clone());
+            entries.extend(policy.entries.iter().cloned());
         }
 
         Ok(Self {
@@ -261,9 +308,13 @@ impl ShellRuntime {
             allowed_shells: config.allowed_shells.clone(),
             non_interactive,
             show_verbose_approval_details,
-            always_on: config.always_on.clone(),
-            selected_sets,
+            entries,
+            active_policy_names: active_display_names,
         })
+    }
+
+    pub fn active_policy_names(&self) -> &[String] {
+        &self.active_policy_names
     }
 
     pub async fn execute_program(
@@ -334,11 +385,7 @@ impl ShellRuntime {
         }
 
         let policy = self.evaluate_policy(&request);
-        let action = if request.requires_approval && policy.action == ShellPolicyAction::Allow {
-            ShellPolicyAction::Ask
-        } else {
-            policy.action
-        };
+        let action = effective_action(&request, policy.action);
 
         if action == ShellPolicyAction::Deny {
             retry_guard.insert(request.fingerprint.clone());
@@ -685,38 +732,15 @@ impl ShellRuntime {
     fn evaluate_policy(&self, request: &NormalizedRequest) -> PolicyDecision {
         let mut segment_states = vec![SegmentPolicyState::default(); request.segments.len()];
 
-        for entry in self
-            .always_on
-            .iter()
-            .chain(self.selected_sets.iter().flat_map(|set| set.entries.iter()))
-        {
-            if let Some(action) = match_command_entry(entry, request) {
-                let summary = entry_summary(entry);
-                for state in &mut segment_states {
-                    if state.locked {
-                        continue;
-                    }
-                    state.action = Some(action);
-                    state.summary = Some(summary.clone());
-                    if entry.terminal {
-                        state.locked = true;
-                    }
-                }
-                continue;
-            }
-
-            let summary = entry_summary(entry);
+        for entry in &self.entries {
             for (index, segment) in request.segments.iter().enumerate() {
                 let state = &mut segment_states[index];
-                if state.locked || !match_program_entry(entry, segment) {
+                if state.locked || !match_dsl_rule(entry, segment) {
                     continue;
                 }
 
                 state.action = Some(entry.action);
-                state.summary = Some(summary.clone());
-                if entry.terminal {
-                    state.locked = true;
-                }
+                state.summary = Some(dsl_rule_summary(entry));
             }
         }
 
@@ -724,6 +748,7 @@ impl ShellRuntime {
             if let Some(action) = segment_states[0].action {
                 return PolicyDecision {
                     action,
+                    used_default: false,
                     reason: format!(
                         "Matched policy entry: {}",
                         segment_states[0].summary.as_deref().unwrap_or_default()
@@ -733,6 +758,7 @@ impl ShellRuntime {
 
             return PolicyDecision {
                 action: self.default_action,
+                used_default: true,
                 reason: format!(
                     "No policy entry matched. The default shell action is '{}'.",
                     action_name(self.default_action)
@@ -783,6 +809,7 @@ impl ShellRuntime {
 
         PolicyDecision {
             action,
+            used_default: all_default,
             reason: if all_default && action == self.default_action {
                 format!(
                     "Pipeline commands fell back to the default shell action '{}'.",
@@ -886,109 +913,92 @@ fn action_name(action: ShellPolicyAction) -> &'static str {
     }
 }
 
-fn match_command_entry(
-    entry: &ShellPolicyEntry,
-    request: &NormalizedRequest,
-) -> Option<ShellPolicyAction> {
-    if let Some(pattern) = &entry.command_glob {
-        return Pattern::new(pattern)
-            .ok()
-            .filter(|glob| glob.matches(&request.normalized_command))
-            .map(|_| entry.action);
-    }
-
-    if let Some(pattern) = &entry.command_regex {
-        return compile_full_match_regex(pattern)
-            .ok()
-            .filter(|regex| regex.is_match(&request.normalized_command))
-            .map(|_| entry.action);
-    }
-
-    None
-}
-
-fn match_program_entry(entry: &ShellPolicyEntry, segment: &NormalizedSegment) -> bool {
-    let Some(program) = &entry.program else {
-        return false;
-    };
-
-    if basename_for_policy(program) != segment.program {
+fn match_dsl_rule(rule: &ShellPolicyRule, segment: &NormalizedSegment) -> bool {
+    if basename_for_policy(&rule.program) != segment.program {
         return false;
     }
 
-    if !entry.args.is_empty() {
-        if entry.args.len() != segment.args.len() {
-            return false;
-        }
-
-        return entry
-            .args
-            .iter()
-            .zip(segment.args.iter())
-            .all(|(matcher, arg)| arg_matches(matcher, arg));
-    }
-
-    if !entry.args_prefix.is_empty() {
-        if segment.args.len() < entry.args_prefix.len() {
-            return false;
-        }
-
-        return entry
-            .args_prefix
-            .iter()
-            .zip(segment.args.iter())
-            .all(|(matcher, arg)| arg_matches(matcher, arg));
-    }
-
-    segment.args.is_empty()
+    dsl_args_match(&rule.args, &segment.args)
 }
 
-fn arg_matches(matcher: &ShellArgMatcher, arg: &str) -> bool {
-    if let Some(expected) = &matcher.exact {
-        return expected == arg;
+fn dsl_args_match(patterns: &[ShellDslArgPattern], args: &[String]) -> bool {
+    fn matches_from(
+        patterns: &[ShellDslArgPattern],
+        args: &[String],
+        pattern_index: usize,
+        arg_index: usize,
+        memo: &mut HashMap<(usize, usize), bool>,
+    ) -> bool {
+        if let Some(result) = memo.get(&(pattern_index, arg_index)) {
+            return *result;
+        }
+
+        let result = if pattern_index == patterns.len() {
+            arg_index == args.len()
+        } else {
+            match &patterns[pattern_index] {
+                ShellDslArgPattern::Exact(expected) => {
+                    args.get(arg_index).is_some_and(|arg| arg == expected)
+                        && matches_from(patterns, args, pattern_index + 1, arg_index + 1, memo)
+                }
+                ShellDslArgPattern::Regex { compiled, .. } => {
+                    args.get(arg_index)
+                        .is_some_and(|arg| compiled.is_match(arg))
+                        && matches_from(patterns, args, pattern_index + 1, arg_index + 1, memo)
+                }
+                ShellDslArgPattern::AnyOne => {
+                    arg_index < args.len()
+                        && matches_from(patterns, args, pattern_index + 1, arg_index + 1, memo)
+                }
+                ShellDslArgPattern::OptionalAny => {
+                    matches_from(patterns, args, pattern_index + 1, arg_index, memo)
+                        || (arg_index < args.len()
+                            && matches_from(patterns, args, pattern_index + 1, arg_index + 1, memo))
+                }
+                ShellDslArgPattern::OneOrMore => (arg_index + 1..=args.len()).any(|next_index| {
+                    matches_from(patterns, args, pattern_index + 1, next_index, memo)
+                }),
+                ShellDslArgPattern::ZeroOrMore => (arg_index..=args.len()).any(|next_index| {
+                    matches_from(patterns, args, pattern_index + 1, next_index, memo)
+                }),
+            }
+        };
+
+        memo.insert((pattern_index, arg_index), result);
+        result
     }
-    if let Some(pattern) = &matcher.glob {
-        return Pattern::new(pattern)
-            .map(|glob| glob.matches(arg))
-            .unwrap_or(false);
-    }
-    if let Some(pattern) = &matcher.regex {
-        return compile_full_match_regex(pattern)
-            .map(|regex| regex.is_match(arg))
-            .unwrap_or(false);
-    }
-    false
+
+    matches_from(patterns, args, 0, 0, &mut HashMap::new())
 }
 
 fn compile_full_match_regex(pattern: &str) -> Result<Regex, regex::Error> {
     Regex::new(&format!(r"\A(?:{})\z", pattern))
 }
 
-fn entry_summary(entry: &ShellPolicyEntry) -> String {
-    let summary = if let Some(program) = &entry.program {
-        if entry.args.is_empty() && entry.args_prefix.is_empty() {
-            format!("program='{}'", basename_for_policy(program))
-        } else {
-            let args = if !entry.args.is_empty() {
-                format!("args=[{}]", format_arg_matchers(&entry.args))
-            } else {
-                format!("args_prefix=[{}]", format_arg_matchers(&entry.args_prefix))
-            };
-            format!("program='{}' {}", basename_for_policy(program), args)
-        }
-    } else if let Some(pattern) = &entry.command_glob {
-        format!("command_glob={}", quote_token(pattern))
-    } else {
-        format!(
-            "command_regex={}",
-            quote_token(entry.command_regex.as_deref().unwrap_or_default())
-        )
-    };
+fn dsl_rule_summary(rule: &ShellPolicyRule) -> String {
+    if rule.args.is_empty() {
+        return format!("program='{}'", basename_for_policy(&rule.program));
+    }
 
-    if entry.terminal {
-        format!("{} terminal=true", summary)
-    } else {
-        summary
+    format!(
+        "program='{}' args=[{}]",
+        basename_for_policy(&rule.program),
+        rule.args
+            .iter()
+            .map(format_dsl_arg_pattern)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn format_dsl_arg_pattern(pattern: &ShellDslArgPattern) -> String {
+    match pattern {
+        ShellDslArgPattern::Exact(value) => format!("exact({})", quote_token(value)),
+        ShellDslArgPattern::Regex { source, .. } => format!("regex({})", quote_token(source)),
+        ShellDslArgPattern::AnyOne => "+".to_string(),
+        ShellDslArgPattern::OptionalAny => "*".to_string(),
+        ShellDslArgPattern::OneOrMore => "++".to_string(),
+        ShellDslArgPattern::ZeroOrMore => "**".to_string(),
     }
 }
 
@@ -1061,7 +1071,7 @@ fn suggested_rule(request: &NormalizedRequest) -> Option<String> {
     let args = segment
         .args
         .iter()
-        .map(|arg| format!("{{ exact = {} }}", quote_toml_string(arg)))
+        .map(|arg| quote_policy_token(arg))
         .collect::<Vec<_>>();
 
     Some(exact_rule_for_segment(&segment.program, &args))
@@ -1078,42 +1088,18 @@ fn suggested_family_rule(request: &NormalizedRequest) -> Option<String> {
         return None;
     }
 
-    let prefix = format!("{{ exact = {} }}", quote_toml_string(first_arg));
     Some(format!(
-        "program = {}\nargs_prefix = [{}]",
-        quote_toml_string(&segment.program),
-        prefix
+        "allow {} {} **",
+        quote_policy_token(&segment.program),
+        quote_policy_token(first_arg)
     ))
-}
-
-fn format_arg_matchers(matchers: &[ShellArgMatcher]) -> String {
-    matchers
-        .iter()
-        .map(|matcher| {
-            if let Some(value) = &matcher.exact {
-                format!("exact({})", quote_token(value))
-            } else if let Some(value) = &matcher.glob {
-                format!("glob({})", quote_token(value))
-            } else {
-                format!(
-                    "regex({})",
-                    quote_token(matcher.regex.as_deref().unwrap_or_default())
-                )
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 fn exact_rule_for_segment(program: &str, args: &[String]) -> String {
     if args.is_empty() {
-        format!("program = {}", quote_toml_string(program))
+        format!("allow {}", quote_policy_token(program))
     } else {
-        format!(
-            "program = {}\nargs = [{}]",
-            quote_toml_string(program),
-            args.join(", ")
-        )
+        format!("allow {} {}", quote_policy_token(program), args.join(" "))
     }
 }
 
@@ -1138,6 +1124,464 @@ fn build_fingerprint(
         cwd_display,
         shell_path.unwrap_or_default(),
     )
+}
+
+impl ShellPolicyRegistry {
+    fn get(&self, name: &str) -> Option<&ShellPolicy> {
+        self.policies.get(&normalize_policy_name(name))
+    }
+}
+
+pub fn load_shell_policy_registry(
+    config: &ShellConfig,
+    config_dir: &Path,
+) -> Result<ShellPolicyRegistry> {
+    let policy_dir = config_dir.join("policies");
+    let mut policies = HashMap::new();
+
+    if !policy_dir.exists() {
+        return Ok(ShellPolicyRegistry { policies });
+    }
+
+    let mut entries = fs::read_dir(&policy_dir)
+        .with_context(|| format!("Failed to read policy directory: {}", policy_dir.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("Failed to read policy directory: {}", policy_dir.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("Failed to inspect policy file: {}", path.display()))?;
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let file_name = entry.file_name();
+        let Some(policy_name) = file_name.to_str() else {
+            bail!(
+                "Policy file name is not valid UTF-8: {}",
+                path.to_string_lossy()
+            );
+        };
+        if policy_name.starts_with('.') {
+            continue;
+        }
+        validate_policy_name(policy_name)
+            .with_context(|| format!("Invalid policy file name '{}'", policy_name))?;
+
+        let normalized = normalize_policy_name(policy_name);
+        if policies.contains_key(&normalized) {
+            bail!(
+                "Duplicate shell policy name '{}'; policy names are case-insensitive",
+                policy_name
+            );
+        }
+
+        let policy = parse_policy_file(policy_name, &path)?;
+        policies.insert(normalized, policy);
+    }
+
+    let registry = ShellPolicyRegistry { policies };
+    validate_policy_tests(config, &registry)?;
+    Ok(registry)
+}
+
+fn validate_policy_tests(config: &ShellConfig, registry: &ShellPolicyRegistry) -> Result<()> {
+    for policy in registry.policies.values() {
+        if policy.tests.is_empty() {
+            continue;
+        }
+
+        let runtime = ShellRuntime {
+            default_action: config.default_action,
+            allowed_shells: config.allowed_shells.clone(),
+            non_interactive: false,
+            show_verbose_approval_details: false,
+            entries: policy.entries.clone(),
+            active_policy_names: vec![policy.name.clone()],
+        };
+
+        for test in &policy.tests {
+            let shell_path = runtime
+                .allowed_shells
+                .first()
+                .cloned()
+                .context("No shells configured in shell.allowed_shells")?;
+            let request = runtime
+                .normalize_shell_request(
+                    RunShellCommandParams {
+                        command: test.command.clone(),
+                        cwd: None,
+                        shell: Some(shell_path),
+                        timeout_ms: None,
+                        max_output: None,
+                    },
+                    false,
+                )
+                .with_context(|| {
+                    format!(
+                        "{}:{}: failed to parse #TEST command for policy '{}'",
+                        policy.path.display(),
+                        test.line,
+                        policy.name
+                    )
+                })?;
+
+            if let Some(rejection) = &request.rejection {
+                bail!(
+                    "{}:{}: #TEST command for policy '{}' is unsupported: {}",
+                    policy.path.display(),
+                    test.line,
+                    policy.name,
+                    rejection.reason
+                );
+            }
+
+            let decision = runtime.evaluate_policy(&request);
+            match test.expected {
+                ShellPolicyTestExpectation::Default => {
+                    if !decision.used_default {
+                        let actual = effective_action(&request, decision.action);
+                        bail!(
+                            "{}:{}: #TEST failed for policy '{}': command `{}` expected 'default' but got '{}'. {}",
+                            policy.path.display(),
+                            test.line,
+                            policy.name,
+                            test.command,
+                            action_name(actual),
+                            decision.reason
+                        );
+                    }
+                }
+                ShellPolicyTestExpectation::Action(expected) => {
+                    let actual = effective_action(&request, decision.action);
+                    if actual != expected {
+                        bail!(
+                            "{}:{}: #TEST failed for policy '{}': command `{}` expected '{}' but got '{}'. {}",
+                            policy.path.display(),
+                            test.line,
+                            policy.name,
+                            test.command,
+                            action_name(expected),
+                            action_name(actual),
+                            decision.reason
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn effective_action(request: &NormalizedRequest, action: ShellPolicyAction) -> ShellPolicyAction {
+    if request.requires_approval && action == ShellPolicyAction::Allow {
+        ShellPolicyAction::Ask
+    } else {
+        action
+    }
+}
+
+fn normalize_policy_name(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
+fn validate_policy_name(name: &str) -> Result<()> {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        bail!("policy name must not be empty");
+    };
+    if !first.is_ascii_alphanumeric() {
+        bail!("policy name must start with an ASCII letter or digit");
+    }
+    if !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-') {
+        bail!("policy name may only contain ASCII letters, digits, '_' and '-'");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DslToken {
+    Word(String),
+    Regex(String),
+}
+
+fn parse_policy_file(policy_name: &str, path: &Path) -> Result<ShellPolicy> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read policy file: {}", path.display()))?;
+    let mut entries = Vec::new();
+    let mut tests = Vec::new();
+    let mut saw_test = false;
+
+    for (index, line) in content.lines().enumerate() {
+        let line_number = index + 1;
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || (trimmed.starts_with('#') && !is_test_line(trimmed)) {
+            continue;
+        }
+
+        if let Some(test_text) = parse_test_line(trimmed) {
+            saw_test = true;
+            tests.push(parse_policy_test(test_text, line_number, path)?);
+            continue;
+        }
+
+        if saw_test {
+            bail!(
+                "{}:{}: policy rules are not allowed after #TEST lines",
+                path.display(),
+                line_number
+            );
+        }
+
+        entries.push(parse_policy_rule(line, line_number, path)?);
+    }
+
+    Ok(ShellPolicy {
+        name: policy_name.to_string(),
+        path: path.to_path_buf(),
+        entries,
+        tests,
+    })
+}
+
+fn is_test_line(line: &str) -> bool {
+    line == "#TEST" || line.starts_with("#TEST ") || line.starts_with("#TEST:")
+}
+
+fn parse_test_line(line: &str) -> Option<&str> {
+    if line == "#TEST" {
+        return Some("");
+    }
+    line.strip_prefix("#TEST:")
+        .or_else(|| line.strip_prefix("#TEST "))
+        .map(str::trim)
+}
+
+fn parse_policy_test(text: &str, line_number: usize, path: &Path) -> Result<ShellPolicyTest> {
+    let trimmed = text.trim();
+    let Some(split_at) = trimmed.find(char::is_whitespace) else {
+        bail!(
+            "{}:{}: #TEST must use `#TEST <allow|ask|deny|default> <command>`",
+            path.display(),
+            line_number
+        );
+    };
+    let expected = &trimmed[..split_at];
+    let command = trimmed[split_at..].trim();
+    if command.is_empty() {
+        bail!(
+            "{}:{}: #TEST must include a command",
+            path.display(),
+            line_number
+        );
+    }
+
+    Ok(ShellPolicyTest {
+        line: line_number,
+        expected: parse_policy_test_expectation(expected).with_context(|| {
+            format!(
+                "{}:{}: invalid #TEST expected action '{}'",
+                path.display(),
+                line_number,
+                expected
+            )
+        })?,
+        command: command.to_string(),
+    })
+}
+
+fn parse_policy_test_expectation(value: &str) -> Result<ShellPolicyTestExpectation> {
+    if value == "default" {
+        Ok(ShellPolicyTestExpectation::Default)
+    } else {
+        parse_policy_action(value).map(ShellPolicyTestExpectation::Action)
+    }
+}
+
+fn parse_policy_rule(line: &str, line_number: usize, path: &Path) -> Result<ShellPolicyRule> {
+    let tokens = lex_policy_line(line)
+        .with_context(|| format!("{}:{}: invalid policy rule", path.display(), line_number))?;
+    if tokens.len() < 2 {
+        bail!(
+            "{}:{}: policy rule must use `<action> <program> <arg-patterns...>`",
+            path.display(),
+            line_number
+        );
+    }
+
+    let DslToken::Word(action_text) = &tokens[0] else {
+        bail!(
+            "{}:{}: policy action must be allow, ask, or deny",
+            path.display(),
+            line_number
+        );
+    };
+    let action = parse_policy_action(action_text).with_context(|| {
+        format!(
+            "{}:{}: invalid policy action '{}'",
+            path.display(),
+            line_number,
+            action_text
+        )
+    })?;
+
+    let DslToken::Word(program) = &tokens[1] else {
+        bail!(
+            "{}:{}: policy program must be an exact program name",
+            path.display(),
+            line_number
+        );
+    };
+    if program.trim().is_empty() {
+        bail!(
+            "{}:{}: policy program must not be empty",
+            path.display(),
+            line_number
+        );
+    }
+
+    let args = tokens[2..]
+        .iter()
+        .map(parse_dsl_arg_pattern)
+        .collect::<Result<Vec<_>>>()
+        .with_context(|| {
+            format!(
+                "{}:{}: invalid policy argument pattern",
+                path.display(),
+                line_number
+            )
+        })?;
+
+    Ok(ShellPolicyRule {
+        action,
+        program: program.clone(),
+        args,
+    })
+}
+
+fn parse_policy_action(value: &str) -> Result<ShellPolicyAction> {
+    match value {
+        "allow" => Ok(ShellPolicyAction::Allow),
+        "ask" => Ok(ShellPolicyAction::Ask),
+        "deny" => Ok(ShellPolicyAction::Deny),
+        _ => bail!("expected allow, ask, or deny"),
+    }
+}
+
+fn parse_dsl_arg_pattern(token: &DslToken) -> Result<ShellDslArgPattern> {
+    match token {
+        DslToken::Regex(pattern) => Ok(ShellDslArgPattern::Regex {
+            source: pattern.clone(),
+            compiled: compile_full_match_regex(pattern)
+                .with_context(|| format!("invalid regex /{}/", pattern))?,
+        }),
+        DslToken::Word(value) => match value.as_str() {
+            "+" => Ok(ShellDslArgPattern::AnyOne),
+            "*" => Ok(ShellDslArgPattern::OptionalAny),
+            "++" => Ok(ShellDslArgPattern::OneOrMore),
+            "**" => Ok(ShellDslArgPattern::ZeroOrMore),
+            _ => Ok(ShellDslArgPattern::Exact(value.clone())),
+        },
+    }
+}
+
+fn lex_policy_line(line: &str) -> Result<Vec<DslToken>> {
+    let mut chars = line.chars().peekable();
+    let mut tokens = Vec::new();
+
+    while let Some(ch) = chars.peek().copied() {
+        if ch.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        if ch == '#' {
+            break;
+        }
+        if ch == '"' {
+            tokens.push(DslToken::Word(read_quoted_policy_token(&mut chars)?));
+        } else if ch == '/' {
+            tokens.push(DslToken::Regex(read_regex_policy_token(&mut chars)?));
+        } else {
+            tokens.push(DslToken::Word(read_bare_policy_token(&mut chars)));
+        }
+    }
+
+    Ok(tokens)
+}
+
+fn read_quoted_policy_token<I>(chars: &mut std::iter::Peekable<I>) -> Result<String>
+where
+    I: Iterator<Item = char>,
+{
+    let quote = chars.next();
+    debug_assert_eq!(quote, Some('"'));
+    let mut value = String::new();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => return Ok(value),
+            '\\' => {
+                let Some(next) = chars.next() else {
+                    bail!("quoted string ends with a dangling escape");
+                };
+                match next {
+                    'n' => value.push('\n'),
+                    'r' => value.push('\r'),
+                    't' => value.push('\t'),
+                    _ => value.push(next),
+                }
+            }
+            _ => value.push(ch),
+        }
+    }
+    bail!("quoted string is missing its closing quote")
+}
+
+fn read_regex_policy_token<I>(chars: &mut std::iter::Peekable<I>) -> Result<String>
+where
+    I: Iterator<Item = char>,
+{
+    let slash = chars.next();
+    debug_assert_eq!(slash, Some('/'));
+    let mut value = String::new();
+    let mut escaped = false;
+    while let Some(ch) = chars.next() {
+        if escaped {
+            value.push('\\');
+            value.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '/' => {
+                if value.is_empty() {
+                    bail!("regex pattern must not be empty");
+                }
+                return Ok(value);
+            }
+            _ => value.push(ch),
+        }
+    }
+    bail!("regex pattern is missing its closing slash")
+}
+
+fn read_bare_policy_token<I>(chars: &mut std::iter::Peekable<I>) -> String
+where
+    I: Iterator<Item = char>,
+{
+    let mut value = String::new();
+    while let Some(ch) = chars.peek().copied() {
+        if ch.is_whitespace() || ch == '#' {
+            break;
+        }
+        value.push(ch);
+        chars.next();
+    }
+    value
 }
 
 fn is_valid_env_name(name: &str) -> bool {
@@ -1374,18 +1818,27 @@ fn quote_token(token: &str) -> String {
     format!("'{}'", token.replace('\'', r#"'\"'\"'"#))
 }
 
-fn quote_toml_string(token: &str) -> String {
+fn quote_policy_token(token: &str) -> String {
+    let needs_quotes = token.is_empty()
+        || matches!(token, "+" | "*" | "++" | "**")
+        || token.starts_with('/')
+        || token.starts_with('#')
+        || token.chars().any(|ch| {
+            ch.is_whitespace() || ch == '"' || ch == '\\' || ch == '#' || ch.is_control()
+        });
+
+    if !needs_quotes {
+        return token.to_string();
+    }
+
     let mut quoted = String::with_capacity(token.len() + 2);
     quoted.push('"');
-
     for ch in token.chars() {
         match ch {
             '\\' => quoted.push_str("\\\\"),
             '"' => quoted.push_str("\\\""),
-            '\u{08}' => quoted.push_str("\\b"),
             '\t' => quoted.push_str("\\t"),
             '\n' => quoted.push_str("\\n"),
-            '\u{0C}' => quoted.push_str("\\f"),
             '\r' => quoted.push_str("\\r"),
             _ if ch.is_control() => {
                 write!(&mut quoted, "\\u{:04X}", ch as u32)
@@ -1394,7 +1847,6 @@ fn quote_toml_string(token: &str) -> String {
             _ => quoted.push(ch),
         }
     }
-
     quoted.push('"');
     quoted
 }
@@ -1950,22 +2402,6 @@ fn is_confirmation_approved(response: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn matcher_exact(value: &str) -> ShellArgMatcher {
-        ShellArgMatcher {
-            exact: Some(value.to_string()),
-            glob: None,
-            regex: None,
-        }
-    }
-
-    fn matcher_regex(value: &str) -> ShellArgMatcher {
-        ShellArgMatcher {
-            exact: None,
-            glob: None,
-            regex: Some(value.to_string()),
-        }
-    }
-
     #[test]
     fn test_confirmation_defaults_to_yes() {
         assert!(is_confirmation_approved(""));
@@ -1977,38 +2413,30 @@ mod tests {
         assert!(!is_confirmation_approved("anything else"));
     }
 
+    fn runtime_with_rules(
+        default_action: ShellPolicyAction,
+        rules: &[&str],
+        non_interactive: bool,
+    ) -> ShellRuntime {
+        ShellRuntime {
+            default_action,
+            allowed_shells: vec!["/bin/sh".to_string(), "/bin/bash".to_string()],
+            non_interactive,
+            show_verbose_approval_details: false,
+            entries: rules
+                .iter()
+                .map(|rule| parse_policy_rule(rule, 1, Path::new("test-policy")).unwrap())
+                .collect(),
+            active_policy_names: Vec::new(),
+        }
+    }
+
     fn test_runtime() -> ShellRuntime {
-        ShellRuntime::new(
-            &ShellConfig {
-                default_action: ShellPolicyAction::Ask,
-                allowed_shells: vec!["/bin/sh".to_string(), "/bin/bash".to_string()],
-                always_on: vec![ShellPolicyEntry {
-                    action: ShellPolicyAction::Allow,
-                    terminal: false,
-                    program: Some("git".to_string()),
-                    args: vec![matcher_exact("status"), matcher_exact("--porcelain")],
-                    args_prefix: Vec::new(),
-                    command_glob: None,
-                    command_regex: None,
-                }],
-                policy_sets: vec![ShellPolicySet {
-                    name: "makefile".to_string(),
-                    entries: vec![ShellPolicyEntry {
-                        action: ShellPolicyAction::Allow,
-                        terminal: false,
-                        program: None,
-                        args: Vec::new(),
-                        args_prefix: Vec::new(),
-                        command_glob: Some("make *".to_string()),
-                        command_regex: None,
-                    }],
-                }],
-            },
-            &["makefile".to_string()],
-            false,
+        runtime_with_rules(
+            ShellPolicyAction::Ask,
+            &["allow git status --porcelain", "allow make test"],
             false,
         )
-        .unwrap()
     }
 
     #[test]
@@ -2037,58 +2465,243 @@ mod tests {
         );
     }
 
+    fn temp_policy_config_dir(name: &str) -> PathBuf {
+        let path = env::temp_dir().join(format!("zo-policy-test-{}-{}", std::process::id(), name));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(path.join("policies")).unwrap();
+        path
+    }
+
     #[test]
-    fn test_match_program_entry_requires_exact_arity() {
-        let entry = ShellPolicyEntry {
-            action: ShellPolicyAction::Allow,
-            terminal: false,
-            program: Some("head".to_string()),
-            args: vec![matcher_exact("-n")],
-            args_prefix: Vec::new(),
-            command_glob: None,
-            command_regex: None,
+    fn test_policy_file_default_loads_and_runs_inline_tests() {
+        let config_dir = temp_policy_config_dir("default-loads");
+        fs::write(
+            config_dir.join("policies").join("default"),
+            r#"
+allow git status
+deny gh auth **
+allow gh pr view /\d+/
+#TEST allow git status
+#TEST deny gh auth login
+#TEST allow gh pr view 100
+#TEST default gh pr view abc
+"#,
+        )
+        .unwrap();
+        let config = ShellConfig::default();
+        let registry = load_shell_policy_registry(&config, &config_dir).unwrap();
+        let runtime =
+            ShellRuntime::new_with_policy_registry(&config, &registry, &[], false, false).unwrap();
+
+        assert_eq!(runtime.active_policy_names(), &["default".to_string()]);
+        let allowed = runtime
+            .normalize_program_request(
+                RunProgramParams {
+                    program: "gh".to_string(),
+                    args: vec!["pr".to_string(), "view".to_string(), "100".to_string()],
+                    cwd: None,
+                    timeout_ms: None,
+                    max_output: None,
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.evaluate_policy(&allowed).action,
+            ShellPolicyAction::Allow
+        );
+    }
+
+    #[test]
+    fn test_policy_inline_default_expectation_ignores_configured_default_action() {
+        let config_dir = temp_policy_config_dir("test-default-expectation");
+        fs::write(
+            config_dir.join("policies").join("default"),
+            "allow git status\n#TEST default ps aux\n",
+        )
+        .unwrap();
+        let config = ShellConfig {
+            default_action: ShellPolicyAction::Deny,
+            ..ShellConfig::default()
         };
+
+        assert!(load_shell_policy_registry(&config, &config_dir).is_ok());
+    }
+
+    #[test]
+    fn test_policy_inline_default_expectation_fails_when_rule_matches() {
+        let config_dir = temp_policy_config_dir("test-default-expectation-fails");
+        fs::write(
+            config_dir.join("policies").join("default"),
+            "allow git status\n#TEST default git status\n",
+        )
+        .unwrap();
+        let result = load_shell_policy_registry(&ShellConfig::default(), &config_dir);
+
+        assert!(result.is_err());
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("expected 'default'"));
+        assert!(error.contains("got 'allow'"));
+    }
+
+    #[test]
+    fn test_named_policy_does_not_include_default_policy() {
+        let config_dir = temp_policy_config_dir("named-excludes-default");
+        fs::write(config_dir.join("policies").join("default"), "deny ps **\n").unwrap();
+        fs::write(config_dir.join("policies").join("coding"), "allow ps aux\n").unwrap();
+        let config = ShellConfig::default();
+        let registry = load_shell_policy_registry(&config, &config_dir).unwrap();
+        let named = ShellRuntime::new_with_policy_registry(
+            &config,
+            &registry,
+            &["coding".to_string()],
+            false,
+            false,
+        )
+        .unwrap();
+
+        let request = named
+            .normalize_program_request(
+                RunProgramParams {
+                    program: "ps".to_string(),
+                    args: vec!["aux".to_string()],
+                    cwd: None,
+                    timeout_ms: None,
+                    max_output: None,
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            named.evaluate_policy(&request).action,
+            ShellPolicyAction::Allow
+        );
+    }
+
+    #[test]
+    fn test_policy_file_names_are_case_insensitive_unique() {
+        let config_dir = temp_policy_config_dir("duplicate-names");
+        fs::write(
+            config_dir.join("policies").join("coding"),
+            "allow git status\n",
+        )
+        .unwrap();
+        fs::write(config_dir.join("policies").join("Coding"), "allow ps aux\n").unwrap();
+        let policy_count = fs::read_dir(config_dir.join("policies"))
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .ok()
+                    .and_then(|entry| {
+                        entry
+                            .file_name()
+                            .to_str()
+                            .map(|name| name.eq_ignore_ascii_case("coding"))
+                    })
+                    .unwrap_or(false)
+            })
+            .count();
+        if policy_count < 2 {
+            return;
+        }
+        let result = load_shell_policy_registry(&ShellConfig::default(), &config_dir);
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Duplicate shell policy name")
+        );
+    }
+
+    #[test]
+    fn test_policy_file_rejects_rules_after_inline_tests() {
+        let config_dir = temp_policy_config_dir("rule-after-test");
+        fs::write(
+            config_dir.join("policies").join("default"),
+            "#TEST ask ps aux\nallow git status\n",
+        )
+        .unwrap();
+        let result = load_shell_policy_registry(&ShellConfig::default(), &config_dir);
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("rules are not allowed after #TEST")
+        );
+    }
+
+    #[test]
+    fn test_policy_inline_tests_compare_effective_action_after_gates() {
+        let config_dir = temp_policy_config_dir("test-gates");
+        fs::write(
+            config_dir.join("policies").join("default"),
+            "allow echo **\n#TEST ask echo *\n",
+        )
+        .unwrap();
+
+        assert!(load_shell_policy_registry(&ShellConfig::default(), &config_dir).is_ok());
+    }
+
+    #[test]
+    fn test_dsl_rule_exact_args_require_exact_arity() {
+        let rule = parse_policy_rule("allow head -n", 1, Path::new("test-policy")).unwrap();
         let segment = NormalizedSegment {
             program: "head".to_string(),
             args: vec!["-n".to_string(), "5".to_string()],
         };
-        assert!(!match_program_entry(&entry, &segment));
+        assert!(!match_dsl_rule(&rule, &segment));
     }
 
     #[test]
-    fn test_match_program_entry_accepts_args_prefix_with_trailing_args() {
-        let entry = ShellPolicyEntry {
-            action: ShellPolicyAction::Allow,
-            terminal: false,
-            program: Some("git".to_string()),
-            args: Vec::new(),
-            args_prefix: vec![matcher_exact("status")],
-            command_glob: None,
-            command_regex: None,
-        };
+    fn test_dsl_rule_zero_or_more_accepts_trailing_args() {
+        let rule = parse_policy_rule("allow git status **", 1, Path::new("test-policy")).unwrap();
         let segment = NormalizedSegment {
             program: "git".to_string(),
             args: vec!["status".to_string(), "--porcelain".to_string()],
         };
-        assert!(match_program_entry(&entry, &segment));
+        assert!(match_dsl_rule(&rule, &segment));
     }
 
     #[test]
-    fn test_arg_regex_requires_full_string_match() {
-        let entry = ShellPolicyEntry {
-            action: ShellPolicyAction::Allow,
-            terminal: false,
-            program: Some("git".to_string()),
-            args: vec![matcher_regex("status")],
-            args_prefix: Vec::new(),
-            command_glob: None,
-            command_regex: None,
-        };
+    fn test_dsl_regex_requires_full_string_match() {
+        let rule = parse_policy_rule("allow git /status/", 1, Path::new("test-policy")).unwrap();
         let segment = NormalizedSegment {
             program: "git".to_string(),
             args: vec!["statusx".to_string()],
         };
-        assert!(!match_program_entry(&entry, &segment));
+        assert!(!match_dsl_rule(&rule, &segment));
+    }
+
+    #[test]
+    fn test_dsl_regex_alternation_requires_full_string_match() {
+        let rule = parse_policy_rule("allow npm /run|build/", 1, Path::new("test-policy")).unwrap();
+
+        assert!(match_dsl_rule(
+            &rule,
+            &NormalizedSegment {
+                program: "npm".to_string(),
+                args: vec!["run".to_string()],
+            }
+        ));
+        assert!(match_dsl_rule(
+            &rule,
+            &NormalizedSegment {
+                program: "npm".to_string(),
+                args: vec!["build".to_string()],
+            }
+        ));
+        assert!(!match_dsl_rule(
+            &rule,
+            &NormalizedSegment {
+                program: "npm".to_string(),
+                args: vec!["build-dangerously".to_string()],
+            }
+        ));
     }
 
     #[test]
@@ -2111,27 +2724,8 @@ mod tests {
     }
 
     #[test]
-    fn test_policy_allow_for_args_prefix_with_trailing_args() {
-        let runtime = ShellRuntime::new(
-            &ShellConfig {
-                default_action: ShellPolicyAction::Ask,
-                allowed_shells: vec!["/bin/sh".to_string()],
-                always_on: vec![ShellPolicyEntry {
-                    action: ShellPolicyAction::Allow,
-                    terminal: false,
-                    program: Some("git".to_string()),
-                    args: Vec::new(),
-                    args_prefix: vec![matcher_exact("status")],
-                    command_glob: None,
-                    command_regex: None,
-                }],
-                policy_sets: Vec::new(),
-            },
-            &[],
-            false,
-            false,
-        )
-        .unwrap();
+    fn test_policy_allow_for_dsl_zero_or_more_with_trailing_args() {
+        let runtime = runtime_with_rules(ShellPolicyAction::Ask, &["allow git status **"], false);
 
         let request = runtime
             .normalize_program_request(
@@ -2151,27 +2745,8 @@ mod tests {
     }
 
     #[test]
-    fn test_command_regex_requires_full_string_match() {
-        let runtime = ShellRuntime::new(
-            &ShellConfig {
-                default_action: ShellPolicyAction::Deny,
-                allowed_shells: vec!["/bin/sh".to_string()],
-                always_on: vec![ShellPolicyEntry {
-                    action: ShellPolicyAction::Allow,
-                    terminal: false,
-                    program: None,
-                    args: Vec::new(),
-                    args_prefix: Vec::new(),
-                    command_glob: None,
-                    command_regex: Some("git status".to_string()),
-                }],
-                policy_sets: Vec::new(),
-            },
-            &[],
-            false,
-            false,
-        )
-        .unwrap();
+    fn test_policy_dsl_regex_requires_full_string_match() {
+        let runtime = runtime_with_rules(ShellPolicyAction::Deny, &["allow git /status/"], false);
 
         let request = runtime
             .normalize_program_request(
@@ -2188,6 +2763,46 @@ mod tests {
 
         let decision = runtime.evaluate_policy(&request);
         assert_eq!(decision.action, ShellPolicyAction::Deny);
+    }
+
+    #[test]
+    fn test_policy_dsl_regex_alternation_requires_full_argument_match() {
+        let runtime =
+            runtime_with_rules(ShellPolicyAction::Deny, &["allow npm /run|build/"], false);
+
+        let build_request = runtime
+            .normalize_program_request(
+                RunProgramParams {
+                    program: "npm".to_string(),
+                    args: vec!["build".to_string()],
+                    cwd: None,
+                    timeout_ms: None,
+                    max_output: None,
+                },
+                false,
+            )
+            .unwrap();
+        let dangerous_request = runtime
+            .normalize_program_request(
+                RunProgramParams {
+                    program: "npm".to_string(),
+                    args: vec!["build-dangerously".to_string()],
+                    cwd: None,
+                    timeout_ms: None,
+                    max_output: None,
+                },
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(
+            runtime.evaluate_policy(&build_request).action,
+            ShellPolicyAction::Allow
+        );
+        assert_eq!(
+            runtime.evaluate_policy(&dangerous_request).action,
+            ShellPolicyAction::Deny
+        );
     }
 
     #[test]
@@ -2215,7 +2830,7 @@ mod tests {
     }
 
     #[test]
-    fn test_policy_set_command_glob_matches() {
+    fn test_policy_dsl_rule_matches_shell_segment() {
         let runtime = test_runtime();
         let request = runtime
             .normalize_shell_request(
@@ -2234,38 +2849,15 @@ mod tests {
     }
 
     #[test]
-    fn test_policy_later_program_rule_overrides_earlier_command_glob() {
-        let runtime = ShellRuntime::new(
-            &ShellConfig {
-                default_action: ShellPolicyAction::Ask,
-                allowed_shells: vec!["/bin/sh".to_string()],
-                always_on: vec![ShellPolicyEntry {
-                    action: ShellPolicyAction::Allow,
-                    terminal: false,
-                    program: None,
-                    args: Vec::new(),
-                    args_prefix: Vec::new(),
-                    command_glob: Some("git status --porcelain".to_string()),
-                    command_regex: None,
-                }],
-                policy_sets: vec![ShellPolicySet {
-                    name: "git".to_string(),
-                    entries: vec![ShellPolicyEntry {
-                        action: ShellPolicyAction::Deny,
-                        terminal: false,
-                        program: Some("git".to_string()),
-                        args: vec![matcher_exact("status"), matcher_exact("--porcelain")],
-                        args_prefix: Vec::new(),
-                        command_glob: None,
-                        command_regex: None,
-                    }],
-                }],
-            },
-            &["git".to_string()],
+    fn test_policy_later_dsl_rule_overrides_earlier_rule() {
+        let runtime = runtime_with_rules(
+            ShellPolicyAction::Ask,
+            &[
+                "allow git status --porcelain",
+                "deny git status --porcelain",
+            ],
             false,
-            false,
-        )
-        .unwrap();
+        );
 
         let request = runtime
             .normalize_program_request(
@@ -2285,38 +2877,15 @@ mod tests {
     }
 
     #[test]
-    fn test_policy_later_command_glob_overrides_earlier_program_rule() {
-        let runtime = ShellRuntime::new(
-            &ShellConfig {
-                default_action: ShellPolicyAction::Ask,
-                allowed_shells: vec!["/bin/sh".to_string()],
-                always_on: vec![ShellPolicyEntry {
-                    action: ShellPolicyAction::Allow,
-                    terminal: false,
-                    program: Some("git".to_string()),
-                    args: vec![matcher_exact("status"), matcher_exact("--porcelain")],
-                    args_prefix: Vec::new(),
-                    command_glob: None,
-                    command_regex: None,
-                }],
-                policy_sets: vec![ShellPolicySet {
-                    name: "git".to_string(),
-                    entries: vec![ShellPolicyEntry {
-                        action: ShellPolicyAction::Deny,
-                        terminal: false,
-                        program: None,
-                        args: Vec::new(),
-                        args_prefix: Vec::new(),
-                        command_glob: Some("git status --porcelain".to_string()),
-                        command_regex: None,
-                    }],
-                }],
-            },
-            &["git".to_string()],
+    fn test_policy_later_dsl_allow_overrides_earlier_deny() {
+        let runtime = runtime_with_rules(
+            ShellPolicyAction::Ask,
+            &[
+                "deny git status --porcelain",
+                "allow git status --porcelain",
+            ],
             false,
-            false,
-        )
-        .unwrap();
+        );
 
         let request = runtime
             .normalize_program_request(
@@ -2324,108 +2893,6 @@ mod tests {
                     program: "git".to_string(),
                     args: vec!["status".to_string(), "--porcelain".to_string()],
                     cwd: None,
-                    timeout_ms: None,
-                    max_output: None,
-                },
-                false,
-            )
-            .unwrap();
-
-        let decision = runtime.evaluate_policy(&request);
-        assert_eq!(decision.action, ShellPolicyAction::Deny);
-    }
-
-    #[test]
-    fn test_terminal_program_rule_locks_only_matching_pipeline_segment() {
-        let runtime = ShellRuntime::new(
-            &ShellConfig {
-                default_action: ShellPolicyAction::Deny,
-                allowed_shells: vec!["/bin/sh".to_string()],
-                always_on: vec![ShellPolicyEntry {
-                    action: ShellPolicyAction::Ask,
-                    terminal: true,
-                    program: Some("git".to_string()),
-                    args: vec![matcher_exact("status"), matcher_exact("--porcelain")],
-                    args_prefix: Vec::new(),
-                    command_glob: None,
-                    command_regex: None,
-                }],
-                policy_sets: vec![ShellPolicySet {
-                    name: "pipeline".to_string(),
-                    entries: vec![ShellPolicyEntry {
-                        action: ShellPolicyAction::Allow,
-                        terminal: false,
-                        program: None,
-                        args: Vec::new(),
-                        args_prefix: Vec::new(),
-                        command_glob: Some("git status --porcelain | head -n 5".to_string()),
-                        command_regex: None,
-                    }],
-                }],
-            },
-            &["pipeline".to_string()],
-            false,
-            false,
-        )
-        .unwrap();
-
-        let request = runtime
-            .normalize_shell_request(
-                RunShellCommandParams {
-                    command: "git status --porcelain | head -n 5".to_string(),
-                    cwd: None,
-                    shell: Some("/bin/sh".to_string()),
-                    timeout_ms: None,
-                    max_output: None,
-                },
-                false,
-            )
-            .unwrap();
-
-        let decision = runtime.evaluate_policy(&request);
-        assert_eq!(decision.action, ShellPolicyAction::Ask);
-    }
-
-    #[test]
-    fn test_terminal_command_glob_locks_entire_pipeline() {
-        let runtime = ShellRuntime::new(
-            &ShellConfig {
-                default_action: ShellPolicyAction::Deny,
-                allowed_shells: vec!["/bin/sh".to_string()],
-                always_on: vec![ShellPolicyEntry {
-                    action: ShellPolicyAction::Allow,
-                    terminal: true,
-                    program: None,
-                    args: Vec::new(),
-                    args_prefix: Vec::new(),
-                    command_glob: Some("git status --porcelain | head -n 5".to_string()),
-                    command_regex: None,
-                }],
-                policy_sets: vec![ShellPolicySet {
-                    name: "git".to_string(),
-                    entries: vec![ShellPolicyEntry {
-                        action: ShellPolicyAction::Deny,
-                        terminal: false,
-                        program: Some("git".to_string()),
-                        args: vec![matcher_exact("status"), matcher_exact("--porcelain")],
-                        args_prefix: Vec::new(),
-                        command_glob: None,
-                        command_regex: None,
-                    }],
-                }],
-            },
-            &["git".to_string()],
-            false,
-            false,
-        )
-        .unwrap();
-
-        let request = runtime
-            .normalize_shell_request(
-                RunShellCommandParams {
-                    command: "git status --porcelain | head -n 5".to_string(),
-                    cwd: None,
-                    shell: Some("/bin/sh".to_string()),
                     timeout_ms: None,
                     max_output: None,
                 },
@@ -2439,18 +2906,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_non_interactive_denies_approval_required_command() {
-        let runtime = ShellRuntime::new(
-            &ShellConfig {
-                default_action: ShellPolicyAction::Ask,
-                allowed_shells: vec!["/bin/sh".to_string()],
-                always_on: Vec::new(),
-                policy_sets: Vec::new(),
-            },
-            &[],
-            true,
-            false,
-        )
-        .unwrap();
+        let runtime = runtime_with_rules(ShellPolicyAction::Ask, &[], true);
 
         let mut retry_guard = HashSet::new();
         let response = runtime
@@ -2474,27 +2930,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_terminal_allow_still_requires_approval() {
-        let runtime = ShellRuntime::new(
-            &ShellConfig {
-                default_action: ShellPolicyAction::Deny,
-                allowed_shells: vec!["/bin/sh".to_string()],
-                always_on: vec![ShellPolicyEntry {
-                    action: ShellPolicyAction::Allow,
-                    terminal: true,
-                    program: None,
-                    args: Vec::new(),
-                    args_prefix: Vec::new(),
-                    command_glob: Some("echo hello && printf world".to_string()),
-                    command_regex: None,
-                }],
-                policy_sets: Vec::new(),
-            },
-            &[],
-            true,
-            false,
-        )
-        .unwrap();
+    async fn test_allowed_gated_command_still_requires_approval() {
+        let runtime = runtime_with_rules(ShellPolicyAction::Allow, &[], true);
 
         let mut retry_guard = HashSet::new();
         let response = runtime
@@ -2514,7 +2951,7 @@ mod tests {
             .unwrap();
 
         assert!(response.contains("\"kind\": \"approval_denied\""));
-        assert!(response.contains("resolved to shell action 'allow'"));
+        assert!(response.contains("--non-interactive"));
     }
 
     #[tokio::test]
@@ -2558,7 +2995,7 @@ mod tests {
     }
 
     #[test]
-    fn test_suggested_rule_is_valid_toml_for_simple_command() {
+    fn test_suggested_rule_is_valid_policy_dsl_for_simple_command() {
         let runtime = test_runtime();
         let request = runtime
             .normalize_program_request(
@@ -2574,21 +3011,14 @@ mod tests {
             .unwrap();
 
         let rule = suggested_rule(&request).unwrap();
-        let config = format!(
-            "[shell]\n[[shell.always_on]]\naction = \"allow\"\n{}\n",
-            rule
-        );
-        let parsed: crate::config::Config = toml::from_str(&config).unwrap();
+        let parsed = parse_policy_rule(&rule, 1, Path::new("test-policy")).unwrap();
 
-        assert_eq!(parsed.shell.always_on[0].program.as_deref(), Some("git"));
-        assert_eq!(
-            parsed.shell.always_on[0].args,
-            vec![matcher_exact("status"), matcher_exact("--porcelain")]
-        );
+        assert_eq!(rule, "allow git status --porcelain");
+        assert!(match_dsl_rule(&parsed, request.segments.first().unwrap()));
     }
 
     #[test]
-    fn test_suggested_rule_escapes_special_characters_for_toml() {
+    fn test_suggested_rule_escapes_special_characters_for_policy_dsl() {
         let runtime = test_runtime();
         let request = runtime
             .normalize_program_request(
@@ -2604,21 +3034,13 @@ mod tests {
             .unwrap();
 
         let rule = suggested_rule(&request).unwrap();
-        let config = format!(
-            "[shell]\n[[shell.always_on]]\naction = \"allow\"\n{}\n",
-            rule
-        );
-        let parsed: crate::config::Config = toml::from_str(&config).unwrap();
+        let parsed = parse_policy_rule(&rule, 1, Path::new("test-policy")).unwrap();
 
-        assert_eq!(parsed.shell.always_on[0].program.as_deref(), Some("printf"));
-        assert_eq!(
-            parsed.shell.always_on[0].args,
-            vec![matcher_exact("can't\\\"stop now")]
-        );
+        assert!(match_dsl_rule(&parsed, request.segments.first().unwrap()));
     }
 
     #[test]
-    fn test_suggested_family_rule_is_valid_toml_for_subcommand_prefix() {
+    fn test_suggested_family_rule_is_valid_policy_dsl_for_subcommand_family() {
         let runtime = test_runtime();
         let request = runtime
             .normalize_program_request(
@@ -2634,18 +3056,17 @@ mod tests {
             .unwrap();
 
         let rule = suggested_family_rule(&request).unwrap();
-        let config = format!(
-            "[shell]\n[[shell.always_on]]\naction = \"allow\"\n{}\n",
-            rule
-        );
-        let parsed: crate::config::Config = toml::from_str(&config).unwrap();
+        let parsed = parse_policy_rule(&rule, 1, Path::new("test-policy")).unwrap();
 
-        assert_eq!(parsed.shell.always_on[0].program.as_deref(), Some("git"));
-        assert_eq!(
-            parsed.shell.always_on[0].args_prefix,
-            vec![matcher_exact("status")]
-        );
-        assert!(parsed.shell.always_on[0].args.is_empty());
+        assert_eq!(rule, "allow git status **");
+        assert!(match_dsl_rule(&parsed, request.segments.first().unwrap()));
+        assert!(match_dsl_rule(
+            &parsed,
+            &NormalizedSegment {
+                program: "git".to_string(),
+                args: vec!["status".to_string()],
+            }
+        ));
     }
 
     #[test]
@@ -2722,17 +3143,9 @@ mod tests {
 
         assert_eq!(prompt.detail_lines[0], "Reason: Policy requested approval.");
         assert_eq!(prompt.detail_lines[1], "Exact durable rule:");
-        assert_eq!(prompt.detail_lines[2], "  program = \"git\"");
-        assert_eq!(
-            prompt.detail_lines[3],
-            "  args = [{ exact = \"status\" }, { exact = \"--porcelain\" }]"
-        );
-        assert_eq!(prompt.detail_lines[4], "Family durable rule (broader):");
-        assert_eq!(prompt.detail_lines[5], "  program = \"git\"");
-        assert_eq!(
-            prompt.detail_lines[6],
-            "  args_prefix = [{ exact = \"status\" }]"
-        );
+        assert_eq!(prompt.detail_lines[2], "  allow git status --porcelain");
+        assert_eq!(prompt.detail_lines[3], "Family durable rule (broader):");
+        assert_eq!(prompt.detail_lines[4], "  allow git status **");
     }
 
     #[test]
@@ -2767,12 +3180,8 @@ mod tests {
         );
         assert_eq!(prompt.detail_lines[2], "Executables: /usr/bin/printf");
         assert_eq!(prompt.detail_lines[3], "Exact durable rule:");
-        assert_eq!(prompt.detail_lines[4], "  program = \"printf\"");
-        assert_eq!(
-            prompt.detail_lines[5],
-            "  args = [{ exact = \"-n\" }, { exact = \"hello\" }]"
-        );
-        assert_eq!(prompt.detail_lines.len(), 6);
+        assert_eq!(prompt.detail_lines[4], "  allow printf -n hello");
+        assert_eq!(prompt.detail_lines.len(), 5);
     }
 
     #[test]

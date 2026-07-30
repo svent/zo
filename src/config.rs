@@ -1,8 +1,6 @@
 use crate::models::{DEFAULT_MODELS, DEFAULT_TEXT_MODEL_NAME};
 use anyhow::{Context, Result};
 use crossterm::style::Color;
-use glob::Pattern;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -42,7 +40,7 @@ pub struct Config {
     /// Path to chat history file (enables history persistence when set)
     pub history_file: Option<String>,
 
-    /// Shell execution policies and defaults
+    /// Shell execution defaults. Policy rules live in ~/.config/zo/policies/.
     #[serde(default)]
     pub shell: ShellConfig,
 }
@@ -75,48 +73,19 @@ impl Default for ShellPolicyAction {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ShellArgMatcher {
-    pub exact: Option<String>,
-    pub glob: Option<String>,
-    pub regex: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ShellPolicyEntry {
-    pub action: ShellPolicyAction,
-    #[serde(default)]
-    pub terminal: bool,
-    pub program: Option<String>,
-    #[serde(default)]
-    pub args: Vec<ShellArgMatcher>,
-    #[serde(default)]
-    pub args_prefix: Vec<ShellArgMatcher>,
-    pub command_glob: Option<String>,
-    pub command_regex: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ShellPolicySet {
-    pub name: String,
-    #[serde(default)]
-    pub entries: Vec<ShellPolicyEntry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ShellConfig {
     #[serde(default)]
     pub default_action: ShellPolicyAction,
     #[serde(default = "default_allowed_shells")]
     pub allowed_shells: Vec<String>,
+    /// Deprecated TOML policy rules. Parsed only to emit a migration error.
     #[serde(default)]
-    pub always_on: Vec<ShellPolicyEntry>,
+    pub always_on: Vec<toml::Value>,
+    /// Deprecated TOML policy sets. Parsed only to emit a migration error.
     #[serde(default)]
-    pub policy_sets: Vec<ShellPolicySet>,
+    pub policy_sets: Vec<toml::Value>,
 }
 
 impl Default for ShellConfig {
@@ -245,99 +214,6 @@ impl InlineColors {
     }
 }
 
-fn validate_shell_arg_matcher(matcher: &ShellArgMatcher, context: &str) -> Result<()> {
-    let populated = matcher.exact.is_some() as u8
-        + matcher.glob.is_some() as u8
-        + matcher.regex.is_some() as u8;
-    if populated != 1 {
-        anyhow::bail!(
-            "{} must specify exactly one of 'exact', 'glob', or 'regex'",
-            context
-        );
-    }
-
-    if let Some(pattern) = &matcher.glob {
-        if pattern.is_empty() {
-            anyhow::bail!("{}.glob must not be empty", context);
-        }
-        Pattern::new(pattern)
-            .with_context(|| format!("{}.glob contains an invalid glob pattern", context))?;
-    }
-
-    if let Some(pattern) = &matcher.regex {
-        if pattern.is_empty() {
-            anyhow::bail!("{}.regex must not be empty", context);
-        }
-        Regex::new(pattern)
-            .with_context(|| format!("{}.regex contains an invalid regular expression", context))?;
-    }
-
-    Ok(())
-}
-
-fn validate_shell_policy_entry(entry: &ShellPolicyEntry, context: &str) -> Result<()> {
-    let matcher_count = entry.program.is_some() as u8
-        + entry.command_glob.is_some() as u8
-        + entry.command_regex.is_some() as u8;
-    if matcher_count != 1 {
-        anyhow::bail!(
-            "{} must specify exactly one matcher: 'program', 'command_glob', or 'command_regex'",
-            context
-        );
-    }
-
-    if let Some(program) = &entry.program {
-        if program.trim().is_empty() {
-            anyhow::bail!("{}.program must not be empty", context);
-        }
-        if entry.command_glob.is_some() || entry.command_regex.is_some() {
-            anyhow::bail!(
-                "{} cannot combine 'program' with 'command_glob' or 'command_regex'",
-                context
-            );
-        }
-        if !entry.args.is_empty() && !entry.args_prefix.is_empty() {
-            anyhow::bail!(
-                "{} cannot combine 'args' with 'args_prefix'; choose exact matching or prefix matching",
-                context
-            );
-        }
-        for (index, matcher) in entry.args.iter().enumerate() {
-            validate_shell_arg_matcher(matcher, &format!("{}.args[{}]", context, index))?;
-        }
-        for (index, matcher) in entry.args_prefix.iter().enumerate() {
-            validate_shell_arg_matcher(matcher, &format!("{}.args_prefix[{}]", context, index))?;
-        }
-    } else if !entry.args.is_empty() {
-        anyhow::bail!("{}.args requires a 'program' matcher", context);
-    } else if !entry.args_prefix.is_empty() {
-        anyhow::bail!("{}.args_prefix requires a 'program' matcher", context);
-    }
-
-    if let Some(pattern) = &entry.command_glob {
-        if pattern.is_empty() {
-            anyhow::bail!("{}.command_glob must not be empty", context);
-        }
-        Pattern::new(pattern).with_context(|| {
-            format!("{}.command_glob contains an invalid glob pattern", context)
-        })?;
-    }
-
-    if let Some(pattern) = &entry.command_regex {
-        if pattern.is_empty() {
-            anyhow::bail!("{}.command_regex must not be empty", context);
-        }
-        Regex::new(pattern).with_context(|| {
-            format!(
-                "{}.command_regex contains an invalid regular expression",
-                context
-            )
-        })?;
-    }
-
-    Ok(())
-}
-
 fn validate_shell_config(shell: &ShellConfig) -> Result<()> {
     if shell.allowed_shells.is_empty() {
         anyhow::bail!("shell.allowed_shells must contain at least one shell path");
@@ -360,31 +236,16 @@ fn validate_shell_config(shell: &ShellConfig) -> Result<()> {
         }
     }
 
-    for (index, entry) in shell.always_on.iter().enumerate() {
-        validate_shell_policy_entry(entry, &format!("shell.always_on[{}]", index))?;
+    if !shell.always_on.is_empty() {
+        anyhow::bail!(
+            "shell.always_on is no longer supported. Move shell policies to files under ~/.config/zo/policies/; for example, put default rules in ~/.config/zo/policies/default using lines like `allow git status`."
+        );
     }
 
-    let mut seen_set_names = std::collections::HashSet::new();
-    for (set_index, set) in shell.policy_sets.iter().enumerate() {
-        if set.name.trim().is_empty() {
-            anyhow::bail!("shell.policy_sets[{}].name must not be empty", set_index);
-        }
-        if !seen_set_names.insert(set.name.to_ascii_lowercase()) {
-            anyhow::bail!("Duplicate shell policy set name '{}'", set.name);
-        }
-        if set.entries.is_empty() {
-            anyhow::bail!(
-                "shell.policy_sets[{}] ('{}') must contain at least one entry",
-                set_index,
-                set.name
-            );
-        }
-        for (entry_index, entry) in set.entries.iter().enumerate() {
-            validate_shell_policy_entry(
-                entry,
-                &format!("shell.policy_sets[{}].entries[{}]", set_index, entry_index),
-            )?;
-        }
+    if !shell.policy_sets.is_empty() {
+        anyhow::bail!(
+            "shell.policy_sets is no longer supported. Move named shell policies to files under ~/.config/zo/policies/; for example, ~/.config/zo/policies/coding is activated with `--policies coding`."
+        );
     }
 
     Ok(())
@@ -394,9 +255,16 @@ fn validate_shell_config(shell: &ShellConfig) -> Result<()> {
 ///
 /// Returns `~/.config/zo/config.toml` on both Linux and macOS.
 pub fn get_config_path() -> Result<PathBuf> {
+    Ok(get_config_dir()?.join("config.toml"))
+}
+
+/// Get the config directory path.
+///
+/// Returns `~/.config/zo` on both Linux and macOS.
+pub fn get_config_dir() -> Result<PathBuf> {
     let home_dir = dirs::home_dir().context("Could not determine home directory")?;
 
-    Ok(home_dir.join(".config").join("zo").join("config.toml"))
+    Ok(home_dir.join(".config").join("zo"))
 }
 
 /// Load configuration from file.
@@ -620,20 +488,15 @@ theme = "base16-ocean.dark"
 # [shell]
 # default_action = "ask"   # allow | ask | deny
 # allowed_shells = ["/bin/sh", "/bin/bash", "/bin/zsh"]
-#
-# [[shell.always_on]]
-# action = "allow"
-# terminal = true       # optional: stop evaluating later rules for this match
-# program = "git"
-# args_prefix = [{{ exact = "status" }}]
-#
-# [[shell.policy_sets]]
-# name = "github_cli"
-#
-# [[shell.policy_sets.entries]]
-# action = "allow"
-# program = "gh"
-# args_prefix = [{{ exact = "pr" }}]
+# Policy rules live in ~/.config/zo/policies/.
+# For example, ~/.config/zo/policies/default can contain:
+#   allow git status
+#   deny gh auth **
+#   allow gh pr view /\d+/
+#   #TEST allow git status
+#   #TEST deny gh auth login
+#   #TEST allow gh pr view 100
+#   #TEST default gh pr view abc
 
 # Model mappings (shortname -> OpenRouter model ID)
 # Built-in aliases stay available by default.
@@ -663,6 +526,30 @@ theme = "base16-ocean.dark"
 "##,
         default_model = DEFAULT_TEXT_MODEL_NAME,
     )
+}
+
+fn render_default_policy_content() -> String {
+    r#"# zo shell policy: default
+# This policy is used when --shell is enabled and no --policies value is provided.
+#
+# Rules use:
+#   <allow|ask|deny> <program> <arg-patterns...>
+#
+# Examples:
+#   allow git status
+#   deny gh auth **
+#   allow gh pr view /\d+/
+#
+# Inline tests are checked when shell mode starts.
+# Rules are not allowed after the first #TEST line.
+#
+# Examples:
+#   #TEST allow git status
+#   #TEST deny gh auth login
+#   #TEST allow gh pr view 100
+#   #TEST default gh pr view abc
+"#
+    .to_string()
 }
 
 #[cfg(test)]
@@ -948,7 +835,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_config_rejects_duplicate_shell_policy_sets() {
+    fn test_validate_config_rejects_legacy_shell_policy_sets() {
         let config = Config {
             api_key: None,
             default_model: None,
@@ -959,32 +846,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig {
-                policy_sets: vec![
-                    ShellPolicySet {
-                        name: "git".to_string(),
-                        entries: vec![ShellPolicyEntry {
-                            action: ShellPolicyAction::Allow,
-                            terminal: false,
-                            program: Some("git".to_string()),
-                            args: vec![],
-                            args_prefix: vec![],
-                            command_glob: None,
-                            command_regex: None,
-                        }],
-                    },
-                    ShellPolicySet {
-                        name: "Git".to_string(),
-                        entries: vec![ShellPolicyEntry {
-                            action: ShellPolicyAction::Ask,
-                            terminal: false,
-                            program: Some("git".to_string()),
-                            args: vec![],
-                            args_prefix: vec![],
-                            command_glob: None,
-                            command_regex: None,
-                        }],
-                    },
-                ],
+                policy_sets: vec![toml::Value::Table(toml::map::Map::new())],
                 ..ShellConfig::default()
             },
         };
@@ -995,51 +857,12 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Duplicate shell policy set name")
+                .contains("shell.policy_sets is no longer supported")
         );
     }
 
     #[test]
-    fn test_validate_config_rejects_invalid_shell_arg_regex() {
-        let config = Config {
-            api_key: None,
-            default_model: None,
-            web: false,
-            models: None,
-            custom_models: vec![],
-            theme: None,
-            inline_colors: None,
-            history_file: None,
-            shell: ShellConfig {
-                always_on: vec![ShellPolicyEntry {
-                    action: ShellPolicyAction::Allow,
-                    terminal: false,
-                    program: Some("head".to_string()),
-                    args: vec![ShellArgMatcher {
-                        exact: None,
-                        glob: None,
-                        regex: Some("(".to_string()),
-                    }],
-                    args_prefix: vec![],
-                    command_glob: None,
-                    command_regex: None,
-                }],
-                ..ShellConfig::default()
-            },
-        };
-
-        let result = validate_config(&config);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("invalid regular expression")
-        );
-    }
-
-    #[test]
-    fn test_shell_policy_entry_terminal_defaults_false() {
+    fn test_validate_config_rejects_legacy_shell_always_on() {
         let config: Config = toml::from_str(
             r#"
                 [shell]
@@ -1051,120 +874,13 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!config.shell.always_on[0].terminal);
-    }
-
-    #[test]
-    fn test_validate_config_accepts_args_prefix() {
-        let config = Config {
-            api_key: None,
-            default_model: None,
-            web: false,
-            models: None,
-            custom_models: vec![],
-            theme: None,
-            inline_colors: None,
-            history_file: None,
-            shell: ShellConfig {
-                always_on: vec![ShellPolicyEntry {
-                    action: ShellPolicyAction::Allow,
-                    terminal: false,
-                    program: Some("git".to_string()),
-                    args: vec![],
-                    args_prefix: vec![ShellArgMatcher {
-                        exact: Some("status".to_string()),
-                        glob: None,
-                        regex: None,
-                    }],
-                    command_glob: None,
-                    command_regex: None,
-                }],
-                ..ShellConfig::default()
-            },
-        };
-
-        assert!(validate_config(&config).is_ok());
-    }
-
-    #[test]
-    fn test_validate_config_rejects_args_and_args_prefix_combination() {
-        let config = Config {
-            api_key: None,
-            default_model: None,
-            web: false,
-            models: None,
-            custom_models: vec![],
-            theme: None,
-            inline_colors: None,
-            history_file: None,
-            shell: ShellConfig {
-                always_on: vec![ShellPolicyEntry {
-                    action: ShellPolicyAction::Allow,
-                    terminal: false,
-                    program: Some("git".to_string()),
-                    args: vec![ShellArgMatcher {
-                        exact: Some("status".to_string()),
-                        glob: None,
-                        regex: None,
-                    }],
-                    args_prefix: vec![ShellArgMatcher {
-                        exact: Some("status".to_string()),
-                        glob: None,
-                        regex: None,
-                    }],
-                    command_glob: None,
-                    command_regex: None,
-                }],
-                ..ShellConfig::default()
-            },
-        };
-
         let result = validate_config(&config);
         assert!(result.is_err());
         assert!(
             result
                 .unwrap_err()
                 .to_string()
-                .contains("cannot combine 'args' with 'args_prefix'")
-        );
-    }
-
-    #[test]
-    fn test_validate_config_rejects_args_prefix_without_program() {
-        let config = Config {
-            api_key: None,
-            default_model: None,
-            web: false,
-            models: None,
-            custom_models: vec![],
-            theme: None,
-            inline_colors: None,
-            history_file: None,
-            shell: ShellConfig {
-                always_on: vec![ShellPolicyEntry {
-                    action: ShellPolicyAction::Allow,
-                    terminal: false,
-                    program: None,
-                    args: vec![],
-                    args_prefix: vec![ShellArgMatcher {
-                        exact: Some("status".to_string()),
-                        glob: None,
-                        regex: None,
-                    }],
-                    command_glob: Some("git *".to_string()),
-                    command_regex: None,
-                }],
-                ..ShellConfig::default()
-            },
-        };
-
-        let result = validate_config(&config);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains(".args_prefix requires a 'program' matcher")
+                .contains("shell.always_on is no longer supported")
         );
     }
 
@@ -1232,12 +948,18 @@ pub fn save_config(config: &Config) -> Result<()> {
 /// - The file cannot be written
 pub fn init_config() -> Result<()> {
     let config_path = get_config_path()?;
+    let default_policy_path = get_config_dir()?.join("policies").join("default");
 
-    // Check if config already exists
     if config_path.exists() {
         anyhow::bail!(
             "Config file already exists at: {}\nRemove it first if you want to reinitialize.",
             config_path.display()
+        );
+    }
+    if default_policy_path.exists() {
+        anyhow::bail!(
+            "Default policy file already exists at: {}\nRemove it first if you want to reinitialize.",
+            default_policy_path.display()
         );
     }
 
@@ -1254,7 +976,22 @@ pub fn init_config() -> Result<()> {
     fs::write(&config_path, config_content)
         .with_context(|| format!("Failed to write config file: {}", config_path.display()))?;
 
+    if let Some(parent) = default_policy_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create policy directory: {}", parent.display()))?;
+    }
+    fs::write(&default_policy_path, render_default_policy_content()).with_context(|| {
+        format!(
+            "Failed to write default policy file: {}",
+            default_policy_path.display()
+        )
+    })?;
+
     println!("✓ Config file created at: {}", config_path.display());
+    println!(
+        "✓ Default shell policy created at: {}",
+        default_policy_path.display()
+    );
     println!("\nNext steps:");
     println!("1. Add your OpenRouter API key to the config file");
     println!("   Or set the OPENROUTER_API_KEY environment variable");

@@ -94,7 +94,7 @@ struct Cli {
     #[arg(long, conflicts_with = "image")]
     web: bool,
 
-    /// Activate named shell policy sets (comma-separated)
+    /// Activate named shell policies (comma-separated)
     #[arg(long, value_delimiter = ',')]
     policies: Vec<String>,
 
@@ -542,9 +542,13 @@ async fn main() -> Result<()> {
     let show_full_tool_args = cli.debug;
 
     let shell_runtime = if tool_access.shell_enabled {
+        let config_dir = config::get_config_dir().context("Failed to resolve config directory")?;
+        let policy_registry = shell::load_shell_policy_registry(&config.shell, &config_dir)
+            .context("Failed to load shell policies")?;
         Some(
-            ShellRuntime::new(
+            ShellRuntime::new_with_policy_registry(
                 &config.shell,
+                &policy_registry,
                 &cli.policies,
                 cli.non_interactive,
                 show_tool_calls,
@@ -554,6 +558,10 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    let active_shell_policies = shell_runtime
+        .as_ref()
+        .map(|runtime| runtime.active_policy_names().to_vec())
+        .unwrap_or_default();
 
     // Resolve which model to use (with fuzzy matching)
     let (model_name, model_entry) =
@@ -566,7 +574,7 @@ async fn main() -> Result<()> {
             &model_entry,
             &parsed_input,
             tool_access,
-            &cli.policies,
+            &active_shell_policies,
             cli.accept_writes,
             cli.non_interactive,
             cli.hidden,
