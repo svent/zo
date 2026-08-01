@@ -6,6 +6,7 @@ A fast, minimal CLI for interacting with LLMs via OpenRouter.
 
 - **Fuzzy model selection** - `/sonnet`, `/gpt4`, `/haiku`
 - **File references** - `@file.txt` to include, `!file.txt` to write, `@!file.txt` to read+write
+- **Multimodal inputs** - `@file.pdf`, `@file.png`, `@file.jpg`, `@file.gif`, and `@file.webp` are sent as native attachments
 - **Interactive chat** - Multi-turn conversations with `--chat`
 - **STDIN piping** - `cat code.rs | zo "review this"`
 - **Streaming output** - Syntax-highlighted markdown in real-time
@@ -22,6 +23,10 @@ zo /sonnet "Explain async/await"
 
 # Include files
 zo "@main.rs Review this code"
+
+# Include a PDF or image
+zo "@document.pdf Summarize this"
+zo "@diagram.png Describe this image"
 
 #$ Pipeline
 git diff | zo 'Summarize these changes'

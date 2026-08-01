@@ -1,5 +1,7 @@
 use anyhow::{Context, Result, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use glob::glob;
+use mime::Mime;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, IsTerminal, Read};
@@ -246,14 +248,21 @@ fn resolve_file_pattern_impl(pattern: &str, allow_missing: bool) -> Result<Vec<S
     Ok(matches)
 }
 
+/// The content of a file referenced with @-syntax
+#[derive(Debug, Clone, PartialEq)]
+pub enum FileReferenceKind {
+    /// UTF-8 text content to include in the regular text context.
+    Text(String),
+    /// PDF or image content encoded as an OpenRouter data URL.
+    Attachment { mime_type: String, data_url: String },
+}
+
 /// A file referenced with @-syntax
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileReference {
     /// The filename as specified by the user
     pub filename: String,
-
-    /// The contents of the file
-    pub content: String,
+    pub kind: FileReferenceKind,
 }
 
 /// An output file specified with !file or @!file syntax
@@ -286,6 +295,61 @@ pub struct ParsedInput {
 
     /// Output files specified with !file or @!file syntax
     pub output_files: Vec<OutputFileSpec>,
+}
+
+fn attachment_mime(path: &str) -> Option<&'static str> {
+    match mime_guess::from_path(path)
+        .first()
+        .as_ref()
+        .map(Mime::essence_str)
+    {
+        Some("application/pdf") => Some("application/pdf"),
+        Some("image/png") => Some("image/png"),
+        Some("image/jpeg") => Some("image/jpeg"),
+        Some("image/gif") => Some("image/gif"),
+        Some("image/webp") => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// Read an input file as text or an encoded PDF/image attachment.
+///
+/// `is_input_output` is true for `@!` references, which may name a new text file.
+fn read_input_file(filename: &str, is_input_output: bool) -> Result<FileReference> {
+    if let Some(attachment_mime) = attachment_mime(filename) {
+        if is_input_output {
+            bail!("Input/output file '{}' must be a text file", filename);
+        }
+        let bytes = fs::read(filename).with_context(|| {
+            format!(
+                "Could not read file '{}'. Make sure it exists and is readable.",
+                filename
+            )
+        })?;
+        let data_url = format!("data:{attachment_mime};base64,{}", BASE64.encode(bytes));
+        return Ok(FileReference {
+            filename: filename.to_string(),
+            kind: FileReferenceKind::Attachment {
+                mime_type: attachment_mime.to_string(),
+                data_url,
+            },
+        });
+    }
+
+    let content = if is_input_output {
+        read_file_if_exists(filename)?
+    } else {
+        fs::read_to_string(filename).with_context(|| {
+            format!(
+                "Could not read file '{}'. Make sure the file exists and is readable as UTF-8.",
+                filename
+            )
+        })?
+    };
+    Ok(FileReference {
+        filename: filename.to_string(),
+        kind: FileReferenceKind::Text(content),
+    })
 }
 
 /// Parse all file patterns (@, !, @!) in a single pass
@@ -438,23 +502,10 @@ pub fn parse_file_patterns(
         // Build input file references (@ and @!)
         if pattern.syntax_type.is_input() {
             for filename in &pattern.resolved_files {
-                let content = if pattern.syntax_type == FileSyntaxType::InputOutput {
-                    // @! syntax - file might not exist yet
-                    read_file_if_exists(filename)?
-                } else {
-                    // @ syntax - file must exist
-                    fs::read_to_string(filename).with_context(|| {
-                        format!(
-                            "Could not read file '{}'. Make sure the file exists and is readable.",
-                            filename
-                        )
-                    })?
-                };
-
-                file_references.push(FileReference {
-                    filename: filename.clone(),
-                    content,
-                });
+                file_references.push(read_input_file(
+                    filename,
+                    pattern.syntax_type == FileSyntaxType::InputOutput,
+                )?);
             }
         }
 
@@ -778,10 +829,63 @@ mod tests {
         let (_prompt, refs, _outputs) = result.unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].filename, "test_file_single.txt");
-        assert_eq!(refs[0].content.trim(), "test content");
+        assert!(
+            matches!(&refs[0].kind, FileReferenceKind::Text(content) if content.trim() == "test content")
+        );
 
         // Cleanup
         std::fs::remove_file(temp_file).ok();
+    }
+
+    #[test]
+    fn test_parse_file_patterns_classifies_pdf() {
+        // Create a temporary file for testing
+        use std::io::Write;
+        let pdf = "test_attachment.pdf";
+        let mut file = std::fs::File::create(pdf).unwrap();
+        writeln!(file, "pdf").unwrap();
+
+        let result = parse_file_patterns("@test_attachment.pdf");
+        assert!(result.is_ok());
+        let (_, refs, _) = result.unwrap();
+        assert_eq!(refs.len(), 1);
+        assert!(matches!(
+            &refs[0].kind,
+            FileReferenceKind::Attachment { mime_type, .. } if mime_type == "application/pdf"
+        ));
+        assert!(
+            matches!(&refs[0].kind, FileReferenceKind::Attachment { data_url, .. }
+                if data_url.starts_with("data:application/pdf;base64,"))
+        );
+
+        // Cleanup
+        std::fs::remove_file(pdf).ok();
+    }
+
+    #[test]
+    fn test_parse_file_patterns_classifies_image() {
+        // Create a temporary file for testing
+        use std::io::Write;
+        let image = "test_attachment.png";
+        let mut file = std::fs::File::create(image).unwrap();
+        writeln!(file, "png").unwrap();
+
+        let result = parse_file_patterns("@test_attachment.png");
+        assert!(result.is_ok());
+        let (_, refs, _) = result.unwrap();
+        assert_eq!(refs.len(), 1);
+        assert!(matches!(
+            &refs[0].kind,
+            FileReferenceKind::Attachment { mime_type, .. } if mime_type == "image/png"
+        ));
+        assert!(matches!(
+            &refs[0].kind,
+            FileReferenceKind::Attachment { data_url, .. }
+                if data_url.starts_with("data:image/png;base64,")
+        ));
+
+        // Cleanup
+        std::fs::remove_file(image).ok();
     }
 
     #[test]
@@ -813,8 +917,12 @@ mod tests {
             .find(|r| r.filename == "test_file_multi2.txt")
             .unwrap();
 
-        assert_eq!(file1_ref.content.trim(), "content 1");
-        assert_eq!(file2_ref.content.trim(), "content 2");
+        assert!(
+            matches!(&file1_ref.kind, FileReferenceKind::Text(content) if content.trim() == "content 1")
+        );
+        assert!(
+            matches!(&file2_ref.kind, FileReferenceKind::Text(content) if content.trim() == "content 2")
+        );
 
         // Cleanup
         std::fs::remove_file(temp_file1).ok();
@@ -854,7 +962,9 @@ mod tests {
         let (_prompt, refs, _outputs) = result.unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].filename, "test_file_end.txt");
-        assert_eq!(refs[0].content.trim(), "ending content");
+        assert!(
+            matches!(&refs[0].kind, FileReferenceKind::Text(content) if content.trim() == "ending content")
+        );
 
         // Cleanup
         std::fs::remove_file(temp_file).ok();
@@ -983,7 +1093,9 @@ mod tests {
         // Should have one file reference (because @! includes input)
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].filename, "test_output_ref.txt");
-        assert_eq!(refs[0].content.trim(), "test content");
+        assert!(
+            matches!(&refs[0].kind, FileReferenceKind::Text(content) if content.trim() == "test content")
+        );
 
         // Should also have one output file
         assert_eq!(outputs.len(), 1);
@@ -1027,8 +1139,12 @@ mod tests {
             .find(|r| r.filename == "test_output_ref2.txt")
             .unwrap();
 
-        assert_eq!(input_ref.content.trim(), "input content");
-        assert_eq!(output_ref.content.trim(), "output content");
+        assert!(
+            matches!(&input_ref.kind, FileReferenceKind::Text(content) if content.trim() == "input content")
+        );
+        assert!(
+            matches!(&output_ref.kind, FileReferenceKind::Text(content) if content.trim() == "output content")
+        );
 
         // Should have one output file (only @! file)
         assert_eq!(outputs.len(), 1);
@@ -1674,7 +1790,7 @@ mod tests {
 }
 #[cfg(test)]
 mod integration_test {
-    use crate::input::parse_input;
+    use crate::input::{FileReferenceKind, parse_input};
     use std::fs;
     use std::io::Write;
 
@@ -1712,7 +1828,9 @@ mod integration_test {
             "Should have 1 file reference"
         );
         assert_eq!(parsed.file_references[0].filename, test_file);
-        assert_eq!(parsed.file_references[0].content.trim(), "existing content");
+        assert!(
+            matches!(&parsed.file_references[0].kind, FileReferenceKind::Text(content) if content.trim() == "existing content")
+        );
 
         // Cleanup
         fs::remove_file(test_file).ok();

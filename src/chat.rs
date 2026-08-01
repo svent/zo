@@ -7,13 +7,14 @@
 
 use anyhow::{Context, Result};
 use openrouter_rs::OpenRouterClient;
+use openrouter_rs::api::chat::Content;
 use std::io::{self, BufRead, Write};
 
 use crate::config::InlineColors;
 use crate::input::parse_file_patterns;
 use crate::models::ModelEntry;
 use crate::readline::ChatReadline;
-use crate::session::{Session, build_user_message};
+use crate::session::{Session, build_typed_user_message};
 use crate::shell::ShellRuntime;
 use crate::tools::ToolAccess;
 
@@ -72,7 +73,7 @@ pub async fn run_chat_session(
             .context("Failed to parse file patterns from initial prompt")?;
 
     // Build first message combining file references, prompt, and STDIN
-    let first_message = build_user_message(
+    let first_message = build_typed_user_message(
         &initial_file_refs,
         &final_initial_prompt,
         options.initial_stdin.as_deref(),
@@ -105,7 +106,11 @@ pub async fn run_chat_session(
     println!("Type 'exit', 'quit', or press Ctrl+D to end the conversation.\n");
 
     // Send first message only if there's content
-    let has_initial_content = !first_message.trim().is_empty();
+    let has_initial_content = match &first_message.content {
+        Content::Text(content) => !content.trim().is_empty(),
+        Content::Parts(parts) => !parts.is_empty(),
+        _ => true,
+    };
     if has_initial_content {
         match session.send_message(first_message).await {
             Ok(_) => {
@@ -155,7 +160,7 @@ pub async fn run_chat_session(
                 }
 
                 // Build message with file references (use expanded prompt)
-                let message = build_user_message(&file_refs, &final_input_prompt, None);
+                let message = build_typed_user_message(&file_refs, &final_input_prompt, None);
 
                 // Send message and get response
                 match session.send_message(message).await {

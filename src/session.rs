@@ -10,7 +10,7 @@
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use openrouter_rs::OpenRouterClient;
-use openrouter_rs::api::chat::{ChatCompletionRequest, Message};
+use openrouter_rs::api::chat::{ChatCompletionRequest, ContentPart, Message};
 use openrouter_rs::types::completion::FinishReason;
 use openrouter_rs::types::stream::StreamEvent;
 use openrouter_rs::types::typed_tool::TypedTool;
@@ -23,7 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::InlineColors;
 use crate::file_ops::FileWriter;
-use crate::input::{FileReference, OutputFileSpec};
+use crate::input::{FileReference, FileReferenceKind, OutputFileSpec};
 use crate::models::ModelEntry;
 use crate::render::StreamRenderer;
 use crate::shell::{RunProgramParams, RunShellCommandParams, ShellRuntime};
@@ -151,7 +151,7 @@ impl Session {
     }
 
     /// Send a user message and get the assistant's response.
-    pub async fn send_message(&mut self, user_content: String) -> Result<String> {
+    pub async fn send_message(&mut self, user_message: Message) -> Result<String> {
         if self.messages.is_empty() {
             let system_prompt = self.build_system_prompt();
             if !system_prompt.is_empty() {
@@ -160,8 +160,7 @@ impl Session {
             }
         }
 
-        self.messages
-            .push(Message::new(Role::User, user_content.as_str()));
+        self.messages.push(user_message);
 
         let mut all_response_text = String::new();
 
@@ -682,11 +681,12 @@ pub fn build_user_message(
     if !file_references.is_empty() {
         let files_formatted = file_references
             .iter()
-            .map(|file_ref| {
-                format!(
+            .filter_map(|file_ref| match &file_ref.kind {
+                FileReferenceKind::Text(content) => Some(format!(
                     "<file name=\"{}\">\n{}\n</file>",
-                    file_ref.filename, file_ref.content
-                )
+                    file_ref.filename, content
+                )),
+                FileReferenceKind::Attachment { .. } => None,
             })
             .collect::<Vec<_>>()
             .join("\n\n");
@@ -702,6 +702,53 @@ pub fn build_user_message(
     }
 
     parts.join("\n\n")
+}
+
+/// Build the typed user message used for text and multimodal requests.
+pub fn build_typed_user_message(
+    file_references: &[FileReference],
+    prompt: &str,
+    stdin_content: Option<&str>,
+) -> Message {
+    let attachments = file_references
+        .iter()
+        .filter_map(|file_ref| match &file_ref.kind {
+            FileReferenceKind::Attachment {
+                mime_type,
+                data_url,
+            } => Some((
+                file_ref.filename.as_str(),
+                mime_type.as_str(),
+                data_url.as_str(),
+            )),
+            FileReferenceKind::Text(_) => None,
+        });
+
+    if !file_references
+        .iter()
+        .any(|file_ref| matches!(&file_ref.kind, FileReferenceKind::Attachment { .. }))
+    {
+        return Message::new(
+            Role::User,
+            build_user_message(file_references, prompt, stdin_content),
+        );
+    }
+
+    let mut parts = Vec::new();
+    let text = build_user_message(file_references, prompt, stdin_content);
+    if !text.is_empty() {
+        parts.push(ContentPart::text(text));
+    }
+
+    for (filename, mime_type, data_url) in attachments {
+        if mime_type == "application/pdf" {
+            parts.push(ContentPart::file_data_with_filename(data_url, filename));
+        } else {
+            parts.push(ContentPart::image_url(data_url));
+        }
+    }
+
+    Message::with_parts(Role::User, parts)
 }
 
 #[cfg(test)]
@@ -749,7 +796,7 @@ mod tests {
     fn test_build_user_message_with_file() {
         let files = vec![FileReference {
             filename: "test.txt".to_string(),
-            content: "content".to_string(),
+            kind: FileReferenceKind::Text("content".to_string()),
         }];
         let msg = build_user_message(&files, "check this", None);
         assert!(msg.contains("<file name=\"test.txt\">"));
@@ -761,7 +808,7 @@ mod tests {
     fn test_build_user_message_all_parts() {
         let files = vec![FileReference {
             filename: "data.csv".to_string(),
-            content: "col1,col2".to_string(),
+            kind: FileReferenceKind::Text("col1,col2".to_string()),
         }];
         let msg = build_user_message(&files, "analyze", Some("extra data"));
         assert!(msg.contains("<file name=\"data.csv\">"));
@@ -774,6 +821,32 @@ mod tests {
     fn test_build_user_message_stdin_only() {
         let msg = build_user_message(&[], "", Some("piped input"));
         assert_eq!(msg, "piped input");
+    }
+
+    #[test]
+    fn test_text_message_serializes_content_as_string() {
+        let message = build_typed_user_message(&[], "hello", None);
+        let value = serde_json::to_value(message).unwrap();
+        assert!(value["content"].is_string());
+    }
+
+    #[test]
+    fn test_multipart_message_serializes_attachment_parts() {
+        let attachment = FileReference {
+            filename: "doc.pdf".to_string(),
+            kind: FileReferenceKind::Attachment {
+                mime_type: "application/pdf".to_string(),
+                data_url: "data:application/pdf;base64,ZmFrZQ==".to_string(),
+            },
+        };
+        let message = build_typed_user_message(&[attachment], "summarize", None);
+        let value = serde_json::to_value(message).unwrap();
+        assert!(value["content"].is_array());
+        assert_eq!(value["content"][1]["file"]["filename"], "doc.pdf");
+        assert_eq!(
+            value["content"][1]["file"]["file_data"],
+            "data:application/pdf;base64,ZmFrZQ=="
+        );
     }
 
     #[test]
