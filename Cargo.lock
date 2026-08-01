@@ -2769,6 +2769,8 @@ dependencies = [
  "grep",
  "ignore",
  "libc",
+ "mime",
+ "mime_guess",
  "openrouter-rs",
  "pulldown-cmark",
  "regex",

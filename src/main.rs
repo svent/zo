@@ -237,7 +237,11 @@ fn display_debug_info(
     if !parsed_input.file_references.is_empty() {
         println!("\nFile References:");
         for file_ref in &parsed_input.file_references {
-            println!("  - {}", file_ref.filename);
+            if let input::FileReferenceKind::Attachment { mime_type, .. } = &file_ref.kind {
+                println!("  - {} ({})", file_ref.filename, mime_type);
+            } else {
+                println!("  - {} (text)", file_ref.filename);
+            }
         }
     } else {
         println!("\nFile References: (none)");
@@ -630,7 +634,7 @@ async fn main() -> Result<()> {
         }
 
         // Build user message
-        let user_message = session::build_user_message(
+        let user_message = session::build_typed_user_message(
             &parsed_input.file_references,
             &parsed_input.prompt,
             parsed_input.stdin_content.as_deref(),
