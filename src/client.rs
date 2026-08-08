@@ -42,6 +42,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![],

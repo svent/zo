@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, ReasoningEffort};
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use std::collections::HashMap;
@@ -10,6 +10,7 @@ use std::fmt;
 pub struct ModelEntry {
     pub model_id: String,
     pub system_prompt: Option<String>,
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +106,7 @@ fn resolve_base_models(config: &Config) -> ResolvedBaseModels {
                 ModelEntry {
                     model_id: model_id.clone(),
                     system_prompt: None,
+                    reasoning_effort: None,
                 },
             )),
             None => builtins.push((
@@ -112,6 +114,7 @@ fn resolve_base_models(config: &Config) -> ResolvedBaseModels {
                 ModelEntry {
                     model_id: default_model_id.to_string(),
                     system_prompt: None,
+                    reasoning_effort: None,
                 },
             )),
         }
@@ -136,6 +139,7 @@ fn resolve_base_models(config: &Config) -> ResolvedBaseModels {
                 ModelEntry {
                     model_id: model_id.clone(),
                     system_prompt: None,
+                    reasoning_effort: None,
                 },
             ));
         }
@@ -174,6 +178,7 @@ pub fn build_model_map(config: &Config) -> HashMap<String, ModelEntry> {
             ModelEntry {
                 model_id: custom.model.clone(),
                 system_prompt: custom.system_prompt.clone(),
+                reasoning_effort: custom.reasoning_effort,
             },
         );
     }
@@ -257,6 +262,7 @@ pub fn resolve_model(
             entry: ModelEntry {
                 model_id: input.to_string(),
                 system_prompt: None,
+                reasoning_effort: None,
             },
             match_kind: ModelMatchKind::DirectId,
         });
@@ -437,12 +443,14 @@ mod tests {
         Config {
             api_key: None,
             default_model: Some("google/gemini-2.0-flash-exp".to_string()),
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![CustomModel {
                 name: "mymodel".to_string(),
                 model: "anthropic/claude-3.5-sonnet".to_string(),
                 system_prompt: Some("You are a helpful assistant".to_string()),
+                reasoning_effort: Some(ReasoningEffort::High),
             }],
             theme: None,
             inline_colors: None,
@@ -457,6 +465,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![],
@@ -509,6 +518,7 @@ mod tests {
             custom.system_prompt,
             Some("You are a helpful assistant".to_string())
         );
+        assert_eq!(custom.reasoning_effort, Some(ReasoningEffort::High));
     }
 
     #[test]
@@ -516,12 +526,14 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![CustomModel {
                 name: "sonnet".to_string(),
                 model: "custom/model-id".to_string(),
                 system_prompt: Some("Custom prompt".to_string()),
+                reasoning_effort: None,
             }],
             theme: None,
             inline_colors: None,
@@ -543,6 +555,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![],
@@ -584,6 +597,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![],
@@ -611,6 +625,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![],
@@ -637,6 +652,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![],
@@ -658,6 +674,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![],
@@ -703,6 +720,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![],
@@ -725,6 +743,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![],
@@ -747,6 +766,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![],
@@ -770,12 +790,14 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![CustomModel {
                 name: "mypro".to_string(),
                 model: "custom/my-model".to_string(),
                 system_prompt: Some("Custom prompt".to_string()),
+                reasoning_effort: None,
             }],
             theme: None,
             inline_colors: None,
@@ -798,6 +820,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![],
@@ -837,6 +860,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: Some(custom_models),
             custom_models: vec![],
@@ -887,12 +911,14 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: Some(base_models),
             custom_models: vec![CustomModel {
                 name: "coder".to_string(),
                 model: "anthropic/claude-3.5-sonnet".to_string(),
                 system_prompt: Some("You are a coding assistant".to_string()),
+                reasoning_effort: None,
             }],
             theme: None,
             inline_colors: None,
@@ -928,6 +954,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: Some(config_models),
             custom_models: vec![],
@@ -956,6 +983,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: Some(config_models),
             custom_models: vec![],
@@ -982,6 +1010,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: Some(config_models),
             custom_models: vec![],

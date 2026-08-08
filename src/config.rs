@@ -15,6 +15,10 @@ pub struct Config {
     /// Default model to use when none specified
     pub default_model: Option<String>,
 
+    /// Default reasoning effort for text and chat requests
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
+
     /// Enable OpenRouter server-side web search by default
     #[serde(default)]
     pub web: bool,
@@ -51,6 +55,35 @@ pub struct Config {
 
 pub const DEFAULT_MAX_INPUT_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_SESSION_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+#[value(rename_all = "lower")]
+pub enum ReasoningEffort {
+    Auto,
+    Max,
+    Xhigh,
+    High,
+    Medium,
+    Low,
+    Minimal,
+    None,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Max => "max",
+            Self::Xhigh => "xhigh",
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+            Self::Minimal => "minimal",
+            Self::None => "none",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -90,6 +123,10 @@ pub struct CustomModel {
 
     /// Optional system prompt for this model
     pub system_prompt: Option<String>,
+
+    /// Optional reasoning effort overriding the global default
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -438,6 +475,7 @@ pub fn get_default_config() -> Config {
     Config {
         api_key: None,
         default_model: Some(DEFAULT_TEXT_MODEL_NAME.to_string()),
+        reasoning_effort: None,
         web: false,
         models: None,
         custom_models: Vec::new(),
@@ -475,6 +513,12 @@ fn render_init_config_content() -> String {
 # This will be used if you don't provide a /model command or --model flag
 # Use short names like "sol", "terra", "luna", "sonnet", "flash", "gpt4o", etc.
 default_model = "{default_model}"
+
+# Default reasoning effort for text and chat requests.
+# Values: auto, max, xhigh, high, medium, low, minimal, none.
+# Defaults to "high" when omitted.
+# "auto" leaves the setting to OpenRouter and the selected model.
+# reasoning_effort = "high"
 
 # Enable OpenRouter server-side web search for text and chat requests
 # You can also enable this per request with --web.
@@ -552,13 +596,14 @@ theme = "base16-ocean.dark"
 #
 # Custom model definitions
 # Define virtual model names that map to actual OpenRouter models
-# You can optionally include a system prompt for each custom model
+# You can optionally include a system prompt and reasoning effort for each custom model
 #
 # Example:
 # [[custom_models]]
 # name = "code"
 # model = "anthropic/claude-sonnet-4.5"
 # system_prompt = "You are an expert programmer. Provide concise, well-commented code."
+# reasoning_effort = "high"
 #
 # [[custom_models]]
 # name = "writer"
@@ -609,6 +654,7 @@ mod tests {
         let config = Config {
             api_key: Some("test-key".to_string()),
             default_model: Some("sol".to_string()),
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![
@@ -616,11 +662,13 @@ mod tests {
                     name: "mymodel".to_string(),
                     model: "anthropic/claude-3.5-sonnet".to_string(),
                     system_prompt: Some("Test prompt".to_string()),
+                    reasoning_effort: None,
                 },
                 CustomModel {
                     name: "another".to_string(),
                     model: "openai/gpt-4o".to_string(),
                     system_prompt: None,
+                    reasoning_effort: None,
                 },
             ],
             theme: Some("base16-ocean.dark".to_string()),
@@ -645,6 +693,61 @@ mod tests {
         let config: Config = toml::from_str("web = true").unwrap();
 
         assert!(config.web);
+    }
+
+    #[test]
+    fn test_reasoning_effort_defaults_unset_when_missing() {
+        let config: Config = toml::from_str("").unwrap();
+
+        assert_eq!(config.reasoning_effort, None);
+    }
+
+    #[test]
+    fn test_reasoning_effort_parses_for_global_and_custom_model() {
+        let config: Config = toml::from_str(
+            r#"
+reasoning_effort = "medium"
+
+[[custom_models]]
+name = "deep"
+model = "anthropic/claude-opus-4.6"
+reasoning_effort = "high"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.reasoning_effort, Some(ReasoningEffort::Medium));
+        assert_eq!(
+            config.custom_models[0].reasoning_effort,
+            Some(ReasoningEffort::High)
+        );
+    }
+
+    #[test]
+    fn test_reasoning_effort_rejects_unknown_value() {
+        let result = toml::from_str::<Config>(r#"reasoning_effort = "extreme""#);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reasoning_effort_parses_all_supported_values() {
+        let cases = [
+            ("auto", ReasoningEffort::Auto),
+            ("max", ReasoningEffort::Max),
+            ("xhigh", ReasoningEffort::Xhigh),
+            ("high", ReasoningEffort::High),
+            ("medium", ReasoningEffort::Medium),
+            ("low", ReasoningEffort::Low),
+            ("minimal", ReasoningEffort::Minimal),
+            ("none", ReasoningEffort::None),
+        ];
+
+        for (value, expected) in cases {
+            let config: Config =
+                toml::from_str(&format!(r#"reasoning_effort = "{value}""#)).unwrap();
+            assert_eq!(config.reasoning_effort, Some(expected));
+        }
     }
 
     #[test]
@@ -676,12 +779,14 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![CustomModel {
                 name: "".to_string(),
                 model: "anthropic/claude-3.5-sonnet".to_string(),
                 system_prompt: None,
+                reasoning_effort: None,
             }],
             theme: None,
             inline_colors: None,
@@ -700,12 +805,14 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![CustomModel {
                 name: "mymodel".to_string(),
                 model: "".to_string(),
                 system_prompt: None,
+                reasoning_effort: None,
             }],
             theme: None,
             inline_colors: None,
@@ -724,6 +831,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![
@@ -731,11 +839,13 @@ mod tests {
                     name: "mymodel".to_string(),
                     model: "anthropic/claude-3.5-sonnet".to_string(),
                     system_prompt: None,
+                    reasoning_effort: None,
                 },
                 CustomModel {
                     name: "MyModel".to_string(), // Case-insensitive duplicate
                     model: "openai/gpt-4o".to_string(),
                     system_prompt: None,
+                    reasoning_effort: None,
                 },
             ],
             theme: None,
@@ -755,6 +865,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: Some(std::collections::HashMap::from([(
                 "sonnet".to_string(),
@@ -777,6 +888,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: Some(std::collections::HashMap::from([(
                 "myalias".to_string(),
@@ -805,6 +917,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![],
@@ -824,6 +937,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![],
@@ -844,6 +958,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![],
@@ -868,6 +983,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![],
@@ -895,6 +1011,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![],
@@ -922,6 +1039,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![],

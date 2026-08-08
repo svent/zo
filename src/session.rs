@@ -14,7 +14,7 @@ use openrouter_rs::api::chat::{ChatCompletionRequest, Message};
 use openrouter_rs::types::completion::FinishReason;
 use openrouter_rs::types::stream::StreamEvent;
 use openrouter_rs::types::typed_tool::TypedTool;
-use openrouter_rs::types::{Role, ServerTool, ToolCall};
+use openrouter_rs::types::{Effort, Role, ServerTool, ToolCall};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::error::Error;
@@ -23,7 +23,7 @@ use std::io::{self, IsTerminal};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::config::InlineColors;
+use crate::config::{InlineColors, ReasoningEffort};
 use crate::file_ops::FileWriter;
 use crate::input::{FileReference, OutputFileSpec};
 use crate::models::ModelEntry;
@@ -58,6 +58,8 @@ pub struct Session {
     tool_access: ToolAccess,
     /// Whether to enable OpenRouter server-side web search
     web_search: bool,
+    /// Effective reasoning effort for all requests in this session
+    reasoning_effort: ReasoningEffort,
     /// Optional shell runtime when shell tools are enabled
     shell_runtime: Option<ShellRuntime>,
     /// Whether confirmation prompts should be suppressed
@@ -87,6 +89,7 @@ pub struct SessionOptions {
     pub inline_colors: InlineColors,
     pub tool_access: ToolAccess,
     pub web_search: bool,
+    pub reasoning_effort: ReasoningEffort,
     pub shell_runtime: Option<ShellRuntime>,
     pub non_interactive: bool,
     pub allow_hidden: bool,
@@ -121,6 +124,19 @@ struct ToolAvailability {
     write_file: bool,
     edit_tools: bool,
     shell_tools: bool,
+}
+
+fn openrouter_reasoning_effort(effort: ReasoningEffort) -> Option<Effort> {
+    match effort {
+        ReasoningEffort::Auto => None,
+        ReasoningEffort::Max => Some(Effort::Max),
+        ReasoningEffort::Xhigh => Some(Effort::Xhigh),
+        ReasoningEffort::High => Some(Effort::High),
+        ReasoningEffort::Medium => Some(Effort::Medium),
+        ReasoningEffort::Low => Some(Effort::Low),
+        ReasoningEffort::Minimal => Some(Effort::Minimal),
+        ReasoningEffort::None => Some(Effort::None),
+    }
 }
 
 fn determine_tool_availability(
@@ -172,6 +188,7 @@ impl Session {
             inline_colors: options.inline_colors,
             tool_access: options.tool_access,
             web_search: options.web_search,
+            reasoning_effort: options.reasoning_effort,
             shell_runtime: options.shell_runtime,
             non_interactive: options.non_interactive,
             allow_hidden: options.allow_hidden,
@@ -398,6 +415,10 @@ impl Session {
             .model(&self.model_entry.model_id)
             .messages(self.messages.clone())
             .session_id(&self.session_id);
+
+        if let Some(effort) = openrouter_reasoning_effort(self.reasoning_effort) {
+            builder.reasoning_effort(effort);
+        }
 
         if availability.read_tools {
             builder.tool(ListFilesParams::create_tool());
@@ -859,6 +880,7 @@ mod tests {
             ModelEntry {
                 model_id: "openai/gpt-5.6-sol".to_string(),
                 system_prompt: None,
+                reasoning_effort: None,
             },
             SessionOptions {
                 output_files: vec![],
@@ -870,6 +892,7 @@ mod tests {
                     shell_enabled: false,
                 },
                 web_search: false,
+                reasoning_effort: ReasoningEffort::Auto,
                 shell_runtime: None,
                 non_interactive: false,
                 allow_hidden: false,
@@ -1030,6 +1053,30 @@ mod tests {
         assert_eq!(json["session_id"], session.session_id);
         assert!(session.session_id.starts_with("zo-"));
         assert!(json.get("temperature").is_none());
+        assert!(json.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn test_build_request_serializes_explicit_reasoning_efforts() {
+        let cases = [
+            (ReasoningEffort::Max, "max"),
+            (ReasoningEffort::Xhigh, "xhigh"),
+            (ReasoningEffort::High, "high"),
+            (ReasoningEffort::Medium, "medium"),
+            (ReasoningEffort::Low, "low"),
+            (ReasoningEffort::Minimal, "minimal"),
+            (ReasoningEffort::None, "none"),
+        ];
+
+        for (effort, expected) in cases {
+            let mut session = test_session();
+            session.reasoning_effort = effort;
+
+            let request = session.build_request().unwrap();
+            let json = serde_json::to_value(&request).unwrap();
+
+            assert_eq!(json["reasoning"]["effort"], expected);
+        }
     }
 
     #[test]

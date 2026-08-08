@@ -155,6 +155,7 @@ mod tests {
         ModelEntry {
             model_id: "test/model".to_string(),
             system_prompt: None,
+            reasoning_effort: None,
         }
     }
 

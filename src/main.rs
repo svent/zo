@@ -21,7 +21,7 @@ mod shell;
 mod system_prompt;
 mod tools;
 
-use config::Config;
+use config::{Config, ReasoningEffort};
 use input::ParsedInput;
 use models::{ModelEntry, ModelMatchKind, ResolvedModel};
 use shell::ShellRuntime;
@@ -61,6 +61,10 @@ struct Cli {
     /// Override model selection (e.g., "sol", "sonnet")
     #[arg(short, long)]
     model: Option<String>,
+
+    /// Set reasoning effort for this request or chat session
+    #[arg(long, value_enum, conflicts_with = "image")]
+    reasoning_effort: Option<ReasoningEffort>,
 
     /// Enable debug mode - show diagnostic info and ask for confirmation before sending request
     #[arg(short, long, conflicts_with = "non_interactive")]
@@ -140,6 +144,7 @@ fn parse_action(cli: &Cli) -> Result<Option<Action>> {
 
     if cli.args.len() != 1
         || cli.model.is_some()
+        || cli.reasoning_effort.is_some()
         || cli.debug
         || cli.verbose
         || cli.chat
@@ -220,6 +225,7 @@ fn resolve_text_model(model_override: Option<String>, config: &Config) -> Result
             entry: ModelEntry {
                 model_id: models::DEFAULT_TEXT_MODEL_ID.to_string(),
                 system_prompt: None,
+                reasoning_effort: None,
             },
             match_kind: ModelMatchKind::DirectId,
         })
@@ -243,12 +249,24 @@ fn resolve_image_model(
                 entry: ModelEntry {
                     model_id: image::DEFAULT_IMAGE_MODEL_ID.to_string(),
                     system_prompt: None,
+                    reasoning_effort: None,
                 },
                 match_kind: ModelMatchKind::DirectId,
             },
             true,
         ))
     }
+}
+
+fn resolve_reasoning_effort(
+    request: Option<ReasoningEffort>,
+    model: Option<ReasoningEffort>,
+    global: Option<ReasoningEffort>,
+) -> ReasoningEffort {
+    request
+        .or(model)
+        .or(global)
+        .unwrap_or(ReasoningEffort::High)
 }
 
 fn resolved_model_name(model: &ResolvedModel) -> &str {
@@ -295,12 +313,22 @@ fn display_debug_info(
     non_interactive: bool,
     allow_hidden: bool,
     web_search: bool,
+    reasoning_effort: ReasoningEffort,
 ) {
     println!("=== DEBUG MODE ===\n");
 
     println!("Model Selected:");
     println!("  Short name: {}", model_name);
     println!("  Full ID:    {}", model_entry.model_id);
+    println!(
+        "  Reasoning:  {}{}",
+        reasoning_effort.as_str(),
+        if reasoning_effort == ReasoningEffort::Auto {
+            " (OpenRouter default)"
+        } else {
+            ""
+        }
+    );
 
     let system_prompt = system_prompt::build_system_prompt(
         model_entry,
@@ -673,6 +701,11 @@ async fn main() -> Result<()> {
         resolve_text_model(model_override, &config).context("Failed to resolve model")?;
     let model_name = resolved_model_name(&resolved_model);
     let model_entry = &resolved_model.entry;
+    let reasoning_effort = resolve_reasoning_effort(
+        cli.reasoning_effort,
+        model_entry.reasoning_effort,
+        config.reasoning_effort,
+    );
 
     if cli.verbose && !cli.debug {
         display_verbose_model(&resolved_model);
@@ -690,6 +723,7 @@ async fn main() -> Result<()> {
             cli.non_interactive,
             cli.hidden,
             web_search,
+            reasoning_effort,
         );
 
         if !ask_for_confirmation()? {
@@ -725,6 +759,7 @@ async fn main() -> Result<()> {
                     inline_colors,
                     tool_access,
                     web_search,
+                    reasoning_effort,
                     shell_runtime: shell_runtime.clone(),
                     non_interactive: cli.non_interactive,
                     allow_hidden: cli.hidden,
@@ -769,6 +804,7 @@ async fn main() -> Result<()> {
                 inline_colors,
                 tool_access,
                 web_search,
+                reasoning_effort,
                 shell_runtime: shell_runtime.clone(),
                 non_interactive: cli.non_interactive,
                 allow_hidden: cli.hidden,
@@ -797,6 +833,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: Some(std::collections::HashMap::new()),
             custom_models: Vec::new(),
@@ -822,6 +859,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: Some("mydefault".to_string()),
+            reasoning_effort: None,
             web: false,
             models: Some(std::collections::HashMap::from([(
                 "mydefault".to_string(),
@@ -839,6 +877,71 @@ mod tests {
 
         assert_eq!(resolved_model_name(&resolved), "mydefault");
         assert_eq!(resolved.entry.model_id, "provider/custom-model");
+    }
+
+    #[test]
+    fn test_reasoning_effort_precedence_auto_reset_and_high_default() {
+        assert_eq!(
+            resolve_reasoning_effort(
+                Some(ReasoningEffort::Low),
+                Some(ReasoningEffort::High),
+                Some(ReasoningEffort::Medium),
+            ),
+            ReasoningEffort::Low
+        );
+        assert_eq!(
+            resolve_reasoning_effort(
+                None,
+                Some(ReasoningEffort::High),
+                Some(ReasoningEffort::Medium),
+            ),
+            ReasoningEffort::High
+        );
+        assert_eq!(
+            resolve_reasoning_effort(None, None, Some(ReasoningEffort::Medium)),
+            ReasoningEffort::Medium
+        );
+        assert_eq!(
+            resolve_reasoning_effort(
+                Some(ReasoningEffort::Auto),
+                Some(ReasoningEffort::High),
+                Some(ReasoningEffort::Medium),
+            ),
+            ReasoningEffort::Auto
+        );
+        assert_eq!(
+            resolve_reasoning_effort(
+                None,
+                Some(ReasoningEffort::Auto),
+                Some(ReasoningEffort::High)
+            ),
+            ReasoningEffort::Auto
+        );
+        assert_eq!(
+            resolve_reasoning_effort(None, None, None),
+            ReasoningEffort::High
+        );
+    }
+
+    #[test]
+    fn test_reasoning_effort_flag_parses_and_rejects_invalid_values() {
+        let cases = [
+            ("auto", ReasoningEffort::Auto),
+            ("max", ReasoningEffort::Max),
+            ("xhigh", ReasoningEffort::Xhigh),
+            ("high", ReasoningEffort::High),
+            ("medium", ReasoningEffort::Medium),
+            ("low", ReasoningEffort::Low),
+            ("minimal", ReasoningEffort::Minimal),
+            ("none", ReasoningEffort::None),
+        ];
+        for (value, expected) in cases {
+            let cli = Cli::try_parse_from(["zo", "--reasoning-effort", value, "hello"]).unwrap();
+            assert_eq!(cli.reasoning_effort, Some(expected));
+        }
+
+        let result = Cli::try_parse_from(["zo", "--reasoning-effort", "extreme", "hello"]);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -905,6 +1008,10 @@ mod tests {
 
         let flagged = Cli::try_parse_from(["zo", "--verbose", "+list-models"]).unwrap();
         assert!(parse_action(&flagged).is_err());
+
+        let reasoned =
+            Cli::try_parse_from(["zo", "--reasoning-effort", "high", "+list-models"]).unwrap();
+        assert!(parse_action(&reasoned).is_err());
     }
 
     #[test]
@@ -989,6 +1096,19 @@ mod tests {
     #[test]
     fn test_image_conflicts_with_web() {
         let result = Cli::try_parse_from(["zo", "--web", "--image", "out.png", "hello"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_image_conflicts_with_reasoning_effort() {
+        let result = Cli::try_parse_from([
+            "zo",
+            "--reasoning-effort",
+            "high",
+            "--image",
+            "out.png",
+            "hello",
+        ]);
         assert!(result.is_err());
     }
 
