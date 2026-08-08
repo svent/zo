@@ -44,7 +44,7 @@ Actions:
 
 Examples:
     zo +list-models
-    zo /codex "Explain lifetimes"
+    zo /sol "Explain lifetimes"
     zo --files read "inspect this project"
     zo --files write --accept-writes "refactor the repo"
     zo --shell "run tests in this repo"
@@ -58,7 +58,7 @@ struct Cli {
     #[arg(value_name = "PROMPT", trailing_var_arg = true)]
     args: Vec<String>,
 
-    /// Override model selection (e.g., "codex", "sonnet")
+    /// Override model selection (e.g., "sol", "sonnet")
     #[arg(short, long)]
     model: Option<String>,
 

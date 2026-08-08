@@ -429,7 +429,7 @@ fn validate_config(config: &Config) -> Result<()> {
 ///
 /// Returns a config with:
 /// - No API key (must be provided via env var or config file)
-/// - Default model: "codex" (OpenAI GPT-5.4)
+/// - Default model: "sol" (OpenAI GPT-5.6 Sol)
 /// - No custom model mappings (uses built-in defaults)
 /// - Empty custom models list
 /// - Default theme: "base16-ocean.dark" (good for dark terminals)
@@ -473,7 +473,7 @@ fn render_init_config_content() -> String {
 
 # Default model to use when none is specified
 # This will be used if you don't provide a /model command or --model flag
-# Use short names like "codex", "sonnet", "flash", "gpt4o", etc.
+# Use short names like "sol", "terra", "luna", "sonnet", "flash", "gpt4o", etc.
 default_model = "{default_model}"
 
 # Enable OpenRouter server-side web search for text and chat requests
@@ -608,7 +608,7 @@ mod tests {
     fn test_validate_config_valid() {
         let config = Config {
             api_key: Some("test-key".to_string()),
-            default_model: Some("codex".to_string()),
+            default_model: Some("sol".to_string()),
             web: false,
             models: None,
             custom_models: vec![
@@ -635,7 +635,7 @@ mod tests {
 
     #[test]
     fn test_web_defaults_false_when_missing() {
-        let config: Config = toml::from_str(r#"default_model = "codex""#).unwrap();
+        let config: Config = toml::from_str(r#"default_model = "sol""#).unwrap();
 
         assert!(!config.web);
     }

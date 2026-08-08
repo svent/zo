@@ -49,12 +49,14 @@ impl fmt::Display for ModelSelectionError {
 
 impl Error for ModelSelectionError {}
 
-pub const DEFAULT_TEXT_MODEL_NAME: &str = "codex";
-pub const DEFAULT_TEXT_MODEL_ID: &str = "openai/gpt-5.4";
+pub const DEFAULT_TEXT_MODEL_NAME: &str = "sol";
+pub const DEFAULT_TEXT_MODEL_ID: &str = "openai/gpt-5.6-sol";
 
 /// Default models mapping short names to OpenRouter model IDs
 pub const DEFAULT_MODELS: &[(&str, &str)] = &[
     (DEFAULT_TEXT_MODEL_NAME, DEFAULT_TEXT_MODEL_ID),
+    ("terra", "openai/gpt-5.6-terra"),
+    ("luna", "openai/gpt-5.6-luna"),
     ("flash", "google/gemini-3-flash-preview"),
     ("geminipro", "google/gemini-pro-latest"),
     ("gpt4.1", "openai/gpt-4.1"),
