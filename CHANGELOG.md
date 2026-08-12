@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.6.0]
+
+### Added
+- Configurable reasoning effort for text and chat requests via global `reasoning_effort`, per-model `custom_models[].reasoning_effort`, and the `--reasoning-effort` CLI override
+- Configurable byte-based input and session limits through `[limits]`, `--max-input-bytes`, and `--max-session-bytes`
+- File-based shell policy DSL under `~/.config/zo/policies/`, with `allow`, `ask`, and `deny` rules; exact and regex argument matching; and `+`, `*`, `++`, and `**` argument cardinality patterns
+- Inline `#TEST` directives for validating shell policy behavior when policies are loaded
+- Built-in `sol`, `terra`, and `luna` aliases for the GPT-5.6 model family
+
+### Changed
+- Default text model changed from `codex` (`openai/gpt-5.4`) to `sol` (`openai/gpt-5.6-sol`)
+- Shell policies now live in flat files under `~/.config/zo/policies/` instead of `shell.always_on` and `shell.policy_sets` in `config.toml`
+- `--policies` now activates named policy files; when no names are supplied, the `default` policy is loaded automatically if present
+- `zo +init-config` now creates both `~/.config/zo/config.toml` and an example `~/.config/zo/policies/default` policy file
+- Legacy `shell.always_on` and `shell.policy_sets` configuration now produces migration errors with guidance to the policy directory
+- Session history is trimmed by complete oldest turns when needed to fit the configured serialized-session limit; an oversized current turn is rejected instead of truncated
+- Chat retries now preserve a pending turn rather than adding the user message again, and distinguish initial stream failures, partial streams, and tool-call continuation after the per-batch round limit
+
+### Improved
+- Safer handling of large inputs with byte-accurate UTF-8 limits and clear source-specific errors
+- More reliable retry behavior for failed or incomplete streams and multi-batch tool-call turns
+- Unicode-safe debug previews for prompts and STDIN
+- Shell policy parsing, validation, matching, approval-rule suggestions, and test coverage
+- Shell implementation split into focused parser, policy, executor, and test modules
+
 ## [0.5.0]
 
 ### Added
