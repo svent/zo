@@ -1,51 +1,69 @@
-# zo - Zettabyte Oracle
+# zo — Zettabyte Oracle
 
-A fast, minimal CLI for interacting with LLMs via OpenRouter.
+A fast, minimal CLI for using OpenRouter models from your terminal. zo handles one-off questions, pipelines, multi-turn chat, file edits, workspace tools, shell commands, web search, and image generation without turning every request into an unrestricted agent session.
+
+## Install
+
+```bash
+cargo install zo-cli
+export OPENROUTER_API_KEY='sk-or-v1-...'
+```
+
+Pre-built binaries and full setup instructions are available in the [documentation](https://zo.svent.dev/docs/installation).
 
 ## Features
 
-- **Fuzzy model selection** - `/sonnet`, `/gpt4`, `/haiku`
-- **File references** - `@file.txt` to include, `!file.txt` to write, `@!file.txt` to read+write
-- **Interactive chat** - Multi-turn conversations with `--chat`
-- **STDIN piping** - `cat code.rs | zo "review this"`
-- **Streaming output** - Syntax-highlighted markdown in real-time
-- **Custom models** - Define aliases with system prompts
+- **Progressive output** — Stream Markdown with syntax-highlighted code in a terminal and plain text in pipelines.
+- **Flexible model selection** — Use aliases such as `/sol` and `/sonnet`, fuzzy matches, or full OpenRouter model IDs.
+- **Reasoning control** — Set effort per request, custom model, or globally.
+- **File references and scoped output** — Read with `@file`, write with `!file`, or read and update with `@!file`; globs are supported.
+- **Workspace file tools** — Let the model inspect a project with `--files read` or edit it with `--files write`.
+- **Shell tools and policies** — Enable live command execution with `--shell` and control approvals through policy files.
+- **Web search** — Add OpenRouter server-side search with `--web`.
+- **Interactive chat** — Keep context across turns with multiline input and file-path completion.
+- **Unix pipelines** — Combine prompts with piped command output or redirect zo's plain-text response.
+- **Image generation** — Generate one image directly to a workspace path with `--image`.
+- **Custom models** — Define aliases with system prompts and model-specific reasoning effort.
+- **Explicit safety controls** — Review diffs, opt into hidden paths, inspect tool calls, and choose interactive or automated approval behavior.
 
-## Quick Example
+## Examples
 
 ```bash
-# Ask a question
-zo "What is Rust?"
+# Ask a question; quotes are optional for simple prompts
+zo How do I unpack a tar file into a directory
 
-# Use a specific model
-zo /sonnet "Explain async/await"
+# Select a model and reasoning effort
+zo --reasoning-effort medium /sonnet 'Explain async Rust'
 
-# Include files
-zo "@main.rs Review this code"
+# Include files or grant a specific output path
+zo '@src/*.rs Review this module'
+zo 'Document this project in !ARCHITECTURE.md'
+zo 'Add error handling to @!src/main.rs'
 
-#$ Pipeline
-git diff | zo 'Summarize these changes'
+# Let the model inspect or edit the current workspace
+zo --files read 'Explain how configuration is loaded'
+zo --files write 'Refactor the parser and update its tests'
 
-# give read & write access to script.py
-# (will show diff of changes and ask for approval)
-zo 'Add type hints to @!script.py'
+# Enable shell commands or current web results
+zo --shell 'Run the test suite and summarize any failures'
+zo --web 'Summarize the latest Rust release announcement'
 
-# give read access to src/*.rs and write-only access to ARCHITECTURE.md
-zo '@src/*.rs document the architecture in !ARCHITECTURE.md'
+# Compose with other commands
+git diff | zo 'Review these changes for bugs'
 
-# Chat mode (supports multiline with Alt-Enter, Ctrl-O, or Ctrl-J)
-zo --chat /sonnet 'Explain async/await'
-> Show me a practical example
-> How does it compare to threads?
-> exit
+# Continue interactively
+zo --chat --files read 'Help me understand this project'
+
+# Generate an image
+zo --image assets/icon.png 'Minimal blue terminal icon'
 ```
 
-## Documentation
+## Permissions
 
-For installation, configuration, and detailed usage guides, visit the docs:
+zo starts without workspace or shell tools. File markers grant access only to the named paths; `--files` grants access inside the current workspace; and `--shell` is separately opt-in and policy-controlled. Existing-file changes show a diff and ask for approval unless `--accept-writes` is set. Hidden tool and output paths remain blocked unless `--hidden` is supplied.
 
-**[zo.svent.dev](https://zo.svent.dev)**
+See [zo.svent.dev](https://zo.svent.dev) for the quick start, complete permission model, configuration, and examples.
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT License — see [LICENSE](LICENSE).
