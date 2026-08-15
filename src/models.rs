@@ -58,17 +58,16 @@ pub const DEFAULT_MODELS: &[(&str, &str)] = &[
     (DEFAULT_TEXT_MODEL_NAME, DEFAULT_TEXT_MODEL_ID),
     ("terra", "openai/gpt-5.6-terra"),
     ("luna", "openai/gpt-5.6-luna"),
-    ("flash", "google/gemini-3-flash-preview"),
-    ("geminipro", "google/gemini-pro-latest"),
+    ("flash", "google/gemini-3.7-flash"),
+    ("geminipro", "~google/gemini-pro-latest"),
     ("gpt4.1", "openai/gpt-4.1"),
     ("gpt4o", "openai/gpt-4o"),
     ("gpt4omini", "openai/gpt-4o-mini"),
-    ("grok", "x-ai/grok-4.3"),
+    ("grok", "x-ai/grok-4.6"),
     ("haiku", "anthropic/claude-3-haiku"),
     ("o1", "openai/o1"),
-    ("opus", "anthropic/claude-opus-4.6"),
-    ("sonnet", "anthropic/claude-sonnet-4.5"),
-    ("sonnet3", "anthropic/claude-3.5-sonnet"),
+    ("opus", "anthropic/claude-opus-4.8"),
+    ("sonnet", "anthropic/claude-sonnet-5"),
     // image models
     ("banana", "google/gemini-3-pro-image-preview"),
 ];
@@ -448,7 +447,7 @@ mod tests {
             models: None,
             custom_models: vec![CustomModel {
                 name: "mymodel".to_string(),
-                model: "anthropic/claude-3.5-sonnet".to_string(),
+                model: "anthropic/claude-sonnet-5".to_string(),
                 system_prompt: Some("You are a helpful assistant".to_string()),
                 reasoning_effort: Some(ReasoningEffort::High),
             }],
@@ -483,6 +482,7 @@ mod tests {
         assert!(model_map.contains_key("sonnet"));
         assert!(model_map.contains_key("flash"));
         assert!(model_map.contains_key("gpt4o"));
+        assert!(!model_map.contains_key("sonnet3"));
 
         // Verify model IDs
         assert_eq!(
@@ -491,17 +491,21 @@ mod tests {
         );
         assert_eq!(
             model_map.get("sonnet").unwrap().model_id,
-            "anthropic/claude-sonnet-4.5"
+            "anthropic/claude-sonnet-5"
+        );
+        assert_eq!(
+            model_map.get("opus").unwrap().model_id,
+            "anthropic/claude-opus-4.8"
         );
         assert_eq!(
             model_map.get("flash").unwrap().model_id,
-            "google/gemini-3-flash-preview"
+            "google/gemini-3.7-flash"
         );
         assert_eq!(
             model_map.get("geminipro").unwrap().model_id,
-            "google/gemini-pro-latest"
+            "~google/gemini-pro-latest"
         );
-        assert_eq!(model_map.get("grok").unwrap().model_id, "x-ai/grok-4.3");
+        assert_eq!(model_map.get("grok").unwrap().model_id, "x-ai/grok-4.6");
     }
 
     #[test]
@@ -513,7 +517,7 @@ mod tests {
         assert!(model_map.contains_key("mymodel"));
 
         let custom = model_map.get("mymodel").unwrap();
-        assert_eq!(custom.model_id, "anthropic/claude-3.5-sonnet");
+        assert_eq!(custom.model_id, "anthropic/claude-sonnet-5");
         assert_eq!(
             custom.system_prompt,
             Some("You are a helpful assistant".to_string())
@@ -570,7 +574,7 @@ mod tests {
         // Test exact match
         let result = select_model("sonnet", &model_map, &config);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().model_id, "anthropic/claude-sonnet-4.5");
+        assert_eq!(result.unwrap().model_id, "anthropic/claude-sonnet-5");
     }
 
     #[test]
@@ -640,11 +644,11 @@ mod tests {
         // Test case insensitive exact match
         let result = select_model("SONNET", &model_map, &config);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().model_id, "anthropic/claude-sonnet-4.5");
+        assert_eq!(result.unwrap().model_id, "anthropic/claude-sonnet-5");
 
         let result2 = select_model("SoNnEt", &model_map, &config);
         assert!(result2.is_some());
-        assert_eq!(result2.unwrap().model_id, "anthropic/claude-sonnet-4.5");
+        assert_eq!(result2.unwrap().model_id, "anthropic/claude-sonnet-5");
     }
 
     #[test]
@@ -735,7 +739,7 @@ mod tests {
         // Test partial match with suffix - "pro" should match "geminipro"
         let result = select_model("pro", &model_map, &config);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().model_id, "google/gemini-pro-latest");
+        assert_eq!(result.unwrap().model_id, "~google/gemini-pro-latest");
     }
 
     #[test]
@@ -916,7 +920,7 @@ mod tests {
             models: Some(base_models),
             custom_models: vec![CustomModel {
                 name: "coder".to_string(),
-                model: "anthropic/claude-3.5-sonnet".to_string(),
+                model: "anthropic/claude-sonnet-5".to_string(),
                 system_prompt: Some("You are a coding assistant".to_string()),
                 reasoning_effort: None,
             }],
@@ -937,7 +941,7 @@ mod tests {
 
         // Verify custom model has system prompt
         let coder = model_map.get("coder").unwrap();
-        assert_eq!(coder.model_id, "anthropic/claude-3.5-sonnet");
+        assert_eq!(coder.model_id, "anthropic/claude-sonnet-5");
         assert_eq!(
             coder.system_prompt,
             Some("You are a coding assistant".to_string())
@@ -997,23 +1001,31 @@ mod tests {
         let model_map = build_model_map(&config);
         let result = select_model("pro", &model_map, &config).unwrap();
 
-        assert_eq!(result.model_id, "google/gemini-pro-latest");
+        assert_eq!(result.model_id, "~google/gemini-pro-latest");
     }
 
     #[test]
-    fn test_select_model_reports_builtin_fuzzy_tie() {
-        use std::collections::HashMap;
-
-        let mut config_models = HashMap::new();
-        config_models.insert("sxonnet".to_string(), "custom/my-sonnet-model".to_string());
-
+    fn test_select_model_reports_custom_fuzzy_tie() {
         let config = Config {
             api_key: None,
             default_model: None,
             reasoning_effort: None,
             web: false,
-            models: Some(config_models),
-            custom_models: vec![],
+            models: None,
+            custom_models: vec![
+                CustomModel {
+                    name: "sonnetx".to_string(),
+                    model: "custom/sonnet-x".to_string(),
+                    system_prompt: None,
+                    reasoning_effort: None,
+                },
+                CustomModel {
+                    name: "sonnety".to_string(),
+                    model: "custom/sonnet-y".to_string(),
+                    system_prompt: None,
+                    reasoning_effort: None,
+                },
+            ],
             theme: None,
             inline_colors: None,
             history_file: None,
@@ -1023,8 +1035,10 @@ mod tests {
 
         let model_map = build_model_map(&config);
         let matcher = SkimMatcherV2::default();
-        assert!(matcher.fuzzy_match("sonnet", "sonet").is_some());
-        assert!(matcher.fuzzy_match("sxonnet", "sonet").is_some());
+        assert_eq!(
+            matcher.fuzzy_match("sonnetx", "sonet"),
+            matcher.fuzzy_match("sonnety", "sonet")
+        );
 
         let error = resolve_model("sonet", &model_map, &config).unwrap_err();
         assert!(matches!(error, ModelSelectionError::Ambiguous { .. }));

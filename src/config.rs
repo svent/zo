@@ -601,7 +601,7 @@ theme = "base16-ocean.dark"
 # Example:
 # [[custom_models]]
 # name = "code"
-# model = "anthropic/claude-sonnet-4.5"
+# model = "anthropic/claude-sonnet-5"
 # system_prompt = "You are an expert programmer. Provide concise, well-commented code."
 # reasoning_effort = "high"
 #
@@ -660,7 +660,7 @@ mod tests {
             custom_models: vec![
                 CustomModel {
                     name: "mymodel".to_string(),
-                    model: "anthropic/claude-3.5-sonnet".to_string(),
+                    model: "anthropic/claude-sonnet-5".to_string(),
                     system_prompt: Some("Test prompt".to_string()),
                     reasoning_effort: None,
                 },
@@ -784,7 +784,7 @@ reasoning_effort = "high"
             models: None,
             custom_models: vec![CustomModel {
                 name: "".to_string(),
-                model: "anthropic/claude-3.5-sonnet".to_string(),
+                model: "anthropic/claude-sonnet-5".to_string(),
                 system_prompt: None,
                 reasoning_effort: None,
             }],
@@ -837,7 +837,7 @@ reasoning_effort = "high"
             custom_models: vec![
                 CustomModel {
                     name: "mymodel".to_string(),
-                    model: "anthropic/claude-3.5-sonnet".to_string(),
+                    model: "anthropic/claude-sonnet-5".to_string(),
                     system_prompt: None,
                     reasoning_effort: None,
                 },
