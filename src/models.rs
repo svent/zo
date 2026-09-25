@@ -51,25 +51,27 @@ impl fmt::Display for ModelSelectionError {
 impl Error for ModelSelectionError {}
 
 pub const DEFAULT_TEXT_MODEL_NAME: &str = "sol";
-pub const DEFAULT_TEXT_MODEL_ID: &str = "openai/gpt-5.6-sol";
+pub const DEFAULT_TEXT_MODEL_ID: &str = "openai/gpt-6-sol";
 
 /// Default models mapping short names to OpenRouter model IDs
 pub const DEFAULT_MODELS: &[(&str, &str)] = &[
     (DEFAULT_TEXT_MODEL_NAME, DEFAULT_TEXT_MODEL_ID),
     ("terra", "openai/gpt-5.6-terra"),
-    ("luna", "openai/gpt-5.6-luna"),
-    ("flash", "google/gemini-3.7-flash"),
+    ("luna", "openai/gpt-6-luna"),
+    ("flash", "google/gemini-3.8-flash"),
+    ("glm", "z-ai/glm-5.3"),
     ("geminipro", "~google/gemini-pro-latest"),
     ("gpt4.1", "openai/gpt-4.1"),
     ("gpt4o", "openai/gpt-4o"),
     ("gpt4omini", "openai/gpt-4o-mini"),
-    ("grok", "x-ai/grok-4.6"),
+    ("grok", "x-ai/grok-4.7"),
     ("haiku", "anthropic/claude-3-haiku"),
     ("o1", "openai/o1"),
-    ("opus", "anthropic/claude-opus-4.8"),
+    ("opus", "anthropic/claude-opus-5.5"),
+    ("fable", "anthropic/claude-fable-5.1"),
     ("sonnet", "anthropic/claude-sonnet-5"),
     // image models
-    ("banana", "google/gemini-3-pro-image-preview"),
+    ("banana", "google/gemini-3-pro-image"),
 ];
 
 struct ResolvedBaseModels {
@@ -495,17 +497,22 @@ mod tests {
         );
         assert_eq!(
             model_map.get("opus").unwrap().model_id,
-            "anthropic/claude-opus-4.8"
+            "anthropic/claude-opus-5.5"
         );
         assert_eq!(
             model_map.get("flash").unwrap().model_id,
-            "google/gemini-3.7-flash"
+            "google/gemini-3.8-flash"
         );
         assert_eq!(
             model_map.get("geminipro").unwrap().model_id,
             "~google/gemini-pro-latest"
         );
-        assert_eq!(model_map.get("grok").unwrap().model_id, "x-ai/grok-4.6");
+        assert_eq!(model_map.get("grok").unwrap().model_id, "x-ai/grok-4.7");
+        assert_eq!(model_map.get("glm").unwrap().model_id, "z-ai/glm-5.3");
+        assert_eq!(
+            model_map.get("fable").unwrap().model_id,
+            "anthropic/claude-fable-5.1"
+        );
     }
 
     #[test]

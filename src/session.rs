@@ -878,7 +878,7 @@ mod tests {
         Session::new(
             client,
             ModelEntry {
-                model_id: "openai/gpt-5.6-sol".to_string(),
+                model_id: "openai/gpt-6-sol".to_string(),
                 system_prompt: None,
                 reasoning_effort: None,
             },

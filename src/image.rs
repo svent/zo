@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::file_ops::write_binary_file;
 use crate::models::ModelEntry;
 
-pub const DEFAULT_IMAGE_MODEL_ID: &str = "google/gemini-2.5-flash-image";
+pub const DEFAULT_IMAGE_MODEL_ID: &str = "google/gemini-3.1-flash-lite-image";
 
 pub struct ImageGenerationOptions {
     pub output_path: String,
