@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.7.0]
+
+### Added
+- Native multimodal file references for PDF, PNG, JPEG, GIF, and WebP files through the existing `@file` syntax
+- Built-in `glm` and `fable` model aliases for `z-ai/glm-5.3` and `anthropic/claude-fable-5.1`
+
+### Changed
+- Default text model updated from `openai/gpt-5.6-sol` to `openai/gpt-6-sol`
+- Default image model updated from `google/gemini-2.5-flash-image` to `google/gemini-3.1-flash-lite-image`
+- Built-in model aliases updated for Luna, Gemini Flash, Grok, Claude Opus, and the `banana` image model
+- PDF and image references are now sent as native multipart attachments, while text references continue to be included as text context
+- `@!file` input/output references remain text-only and reject PDF and image attachments with a clear error
+
+### Improved
+- Attachment data is included in byte-based input limit enforcement alongside prompts, text files, and STDIN
+- Debug output now identifies each file reference as text or reports its attachment MIME type
+- Failed stream retries preserve the original typed message, including all attachments
+
 ## [0.6.0]
 
 ### Added
