@@ -1,8 +1,6 @@
 use crate::models::{DEFAULT_MODELS, DEFAULT_TEXT_MODEL_NAME};
 use anyhow::{Context, Result};
 use crossterm::style::Color;
-use glob::Pattern;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,6 +14,10 @@ pub struct Config {
 
     /// Default model to use when none specified
     pub default_model: Option<String>,
+
+    /// Default reasoning effort for text and chat requests
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
 
     /// Enable OpenRouter server-side web search by default
     #[serde(default)]
@@ -42,9 +44,71 @@ pub struct Config {
     /// Path to chat history file (enables history persistence when set)
     pub history_file: Option<String>,
 
-    /// Shell execution policies and defaults
+    /// Shell execution defaults. Policy rules live in ~/.config/zo/policies/.
     #[serde(default)]
     pub shell: ShellConfig,
+
+    /// Safety limits for submitted input and retained conversation context.
+    #[serde(default)]
+    pub limits: LimitsConfig,
+}
+
+pub const DEFAULT_MAX_INPUT_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_MAX_SESSION_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+#[value(rename_all = "lower")]
+pub enum ReasoningEffort {
+    Auto,
+    Max,
+    Xhigh,
+    High,
+    Medium,
+    Low,
+    Minimal,
+    None,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Max => "max",
+            Self::Xhigh => "xhigh",
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+            Self::Minimal => "minimal",
+            Self::None => "none",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LimitsConfig {
+    #[serde(default = "default_max_input_bytes")]
+    pub max_input_bytes: usize,
+    #[serde(default = "default_max_session_bytes")]
+    pub max_session_bytes: usize,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
+            max_session_bytes: DEFAULT_MAX_SESSION_BYTES,
+        }
+    }
+}
+
+fn default_max_input_bytes() -> usize {
+    DEFAULT_MAX_INPUT_BYTES
+}
+
+fn default_max_session_bytes() -> usize {
+    DEFAULT_MAX_SESSION_BYTES
 }
 
 /// Custom model definition
@@ -59,6 +123,10 @@ pub struct CustomModel {
 
     /// Optional system prompt for this model
     pub system_prompt: Option<String>,
+
+    /// Optional reasoning effort overriding the global default
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -75,48 +143,19 @@ impl Default for ShellPolicyAction {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ShellArgMatcher {
-    pub exact: Option<String>,
-    pub glob: Option<String>,
-    pub regex: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ShellPolicyEntry {
-    pub action: ShellPolicyAction,
-    #[serde(default)]
-    pub terminal: bool,
-    pub program: Option<String>,
-    #[serde(default)]
-    pub args: Vec<ShellArgMatcher>,
-    #[serde(default)]
-    pub args_prefix: Vec<ShellArgMatcher>,
-    pub command_glob: Option<String>,
-    pub command_regex: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ShellPolicySet {
-    pub name: String,
-    #[serde(default)]
-    pub entries: Vec<ShellPolicyEntry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ShellConfig {
     #[serde(default)]
     pub default_action: ShellPolicyAction,
     #[serde(default = "default_allowed_shells")]
     pub allowed_shells: Vec<String>,
+    /// Deprecated TOML policy rules. Parsed only to emit a migration error.
     #[serde(default)]
-    pub always_on: Vec<ShellPolicyEntry>,
+    pub always_on: Vec<toml::Value>,
+    /// Deprecated TOML policy sets. Parsed only to emit a migration error.
     #[serde(default)]
-    pub policy_sets: Vec<ShellPolicySet>,
+    pub policy_sets: Vec<toml::Value>,
 }
 
 impl Default for ShellConfig {
@@ -245,99 +284,6 @@ impl InlineColors {
     }
 }
 
-fn validate_shell_arg_matcher(matcher: &ShellArgMatcher, context: &str) -> Result<()> {
-    let populated = matcher.exact.is_some() as u8
-        + matcher.glob.is_some() as u8
-        + matcher.regex.is_some() as u8;
-    if populated != 1 {
-        anyhow::bail!(
-            "{} must specify exactly one of 'exact', 'glob', or 'regex'",
-            context
-        );
-    }
-
-    if let Some(pattern) = &matcher.glob {
-        if pattern.is_empty() {
-            anyhow::bail!("{}.glob must not be empty", context);
-        }
-        Pattern::new(pattern)
-            .with_context(|| format!("{}.glob contains an invalid glob pattern", context))?;
-    }
-
-    if let Some(pattern) = &matcher.regex {
-        if pattern.is_empty() {
-            anyhow::bail!("{}.regex must not be empty", context);
-        }
-        Regex::new(pattern)
-            .with_context(|| format!("{}.regex contains an invalid regular expression", context))?;
-    }
-
-    Ok(())
-}
-
-fn validate_shell_policy_entry(entry: &ShellPolicyEntry, context: &str) -> Result<()> {
-    let matcher_count = entry.program.is_some() as u8
-        + entry.command_glob.is_some() as u8
-        + entry.command_regex.is_some() as u8;
-    if matcher_count != 1 {
-        anyhow::bail!(
-            "{} must specify exactly one matcher: 'program', 'command_glob', or 'command_regex'",
-            context
-        );
-    }
-
-    if let Some(program) = &entry.program {
-        if program.trim().is_empty() {
-            anyhow::bail!("{}.program must not be empty", context);
-        }
-        if entry.command_glob.is_some() || entry.command_regex.is_some() {
-            anyhow::bail!(
-                "{} cannot combine 'program' with 'command_glob' or 'command_regex'",
-                context
-            );
-        }
-        if !entry.args.is_empty() && !entry.args_prefix.is_empty() {
-            anyhow::bail!(
-                "{} cannot combine 'args' with 'args_prefix'; choose exact matching or prefix matching",
-                context
-            );
-        }
-        for (index, matcher) in entry.args.iter().enumerate() {
-            validate_shell_arg_matcher(matcher, &format!("{}.args[{}]", context, index))?;
-        }
-        for (index, matcher) in entry.args_prefix.iter().enumerate() {
-            validate_shell_arg_matcher(matcher, &format!("{}.args_prefix[{}]", context, index))?;
-        }
-    } else if !entry.args.is_empty() {
-        anyhow::bail!("{}.args requires a 'program' matcher", context);
-    } else if !entry.args_prefix.is_empty() {
-        anyhow::bail!("{}.args_prefix requires a 'program' matcher", context);
-    }
-
-    if let Some(pattern) = &entry.command_glob {
-        if pattern.is_empty() {
-            anyhow::bail!("{}.command_glob must not be empty", context);
-        }
-        Pattern::new(pattern).with_context(|| {
-            format!("{}.command_glob contains an invalid glob pattern", context)
-        })?;
-    }
-
-    if let Some(pattern) = &entry.command_regex {
-        if pattern.is_empty() {
-            anyhow::bail!("{}.command_regex must not be empty", context);
-        }
-        Regex::new(pattern).with_context(|| {
-            format!(
-                "{}.command_regex contains an invalid regular expression",
-                context
-            )
-        })?;
-    }
-
-    Ok(())
-}
-
 fn validate_shell_config(shell: &ShellConfig) -> Result<()> {
     if shell.allowed_shells.is_empty() {
         anyhow::bail!("shell.allowed_shells must contain at least one shell path");
@@ -360,31 +306,16 @@ fn validate_shell_config(shell: &ShellConfig) -> Result<()> {
         }
     }
 
-    for (index, entry) in shell.always_on.iter().enumerate() {
-        validate_shell_policy_entry(entry, &format!("shell.always_on[{}]", index))?;
+    if !shell.always_on.is_empty() {
+        anyhow::bail!(
+            "shell.always_on is no longer supported. Move shell policies to files under ~/.config/zo/policies/; for example, put default rules in ~/.config/zo/policies/default using lines like `allow git status`."
+        );
     }
 
-    let mut seen_set_names = std::collections::HashSet::new();
-    for (set_index, set) in shell.policy_sets.iter().enumerate() {
-        if set.name.trim().is_empty() {
-            anyhow::bail!("shell.policy_sets[{}].name must not be empty", set_index);
-        }
-        if !seen_set_names.insert(set.name.to_ascii_lowercase()) {
-            anyhow::bail!("Duplicate shell policy set name '{}'", set.name);
-        }
-        if set.entries.is_empty() {
-            anyhow::bail!(
-                "shell.policy_sets[{}] ('{}') must contain at least one entry",
-                set_index,
-                set.name
-            );
-        }
-        for (entry_index, entry) in set.entries.iter().enumerate() {
-            validate_shell_policy_entry(
-                entry,
-                &format!("shell.policy_sets[{}].entries[{}]", set_index, entry_index),
-            )?;
-        }
+    if !shell.policy_sets.is_empty() {
+        anyhow::bail!(
+            "shell.policy_sets is no longer supported. Move named shell policies to files under ~/.config/zo/policies/; for example, ~/.config/zo/policies/coding is activated with `--policies coding`."
+        );
     }
 
     Ok(())
@@ -394,9 +325,16 @@ fn validate_shell_config(shell: &ShellConfig) -> Result<()> {
 ///
 /// Returns `~/.config/zo/config.toml` on both Linux and macOS.
 pub fn get_config_path() -> Result<PathBuf> {
+    Ok(get_config_dir()?.join("config.toml"))
+}
+
+/// Get the config directory path.
+///
+/// Returns `~/.config/zo` on both Linux and macOS.
+pub fn get_config_dir() -> Result<PathBuf> {
     let home_dir = dirs::home_dir().context("Could not determine home directory")?;
 
-    Ok(home_dir.join(".config").join("zo").join("config.toml"))
+    Ok(home_dir.join(".config").join("zo"))
 }
 
 /// Load configuration from file.
@@ -441,6 +379,13 @@ pub fn load_config() -> Result<Config> {
 /// - Inline color values are valid (if specified)
 /// - Shell policy configuration is valid (if specified)
 fn validate_config(config: &Config) -> Result<()> {
+    if config.limits.max_input_bytes == 0 {
+        anyhow::bail!("limits.max_input_bytes must be greater than zero");
+    }
+    if config.limits.max_session_bytes == 0 {
+        anyhow::bail!("limits.max_session_bytes must be greater than zero");
+    }
+
     if let Some(models) = &config.models {
         for (name, model_id) in models {
             if name.trim().is_empty() {
@@ -521,7 +466,7 @@ fn validate_config(config: &Config) -> Result<()> {
 ///
 /// Returns a config with:
 /// - No API key (must be provided via env var or config file)
-/// - Default model: "codex" (OpenAI Codex 5.3)
+/// - Default model: "sol" (OpenAI GPT-5.6 Sol)
 /// - No custom model mappings (uses built-in defaults)
 /// - Empty custom models list
 /// - Default theme: "base16-ocean.dark" (good for dark terminals)
@@ -530,6 +475,7 @@ pub fn get_default_config() -> Config {
     Config {
         api_key: None,
         default_model: Some(DEFAULT_TEXT_MODEL_NAME.to_string()),
+        reasoning_effort: None,
         web: false,
         models: None,
         custom_models: Vec::new(),
@@ -537,6 +483,7 @@ pub fn get_default_config() -> Config {
         inline_colors: None,
         history_file: None, // History disabled by default
         shell: ShellConfig::default(),
+        limits: LimitsConfig::default(),
     }
 }
 
@@ -564,8 +511,14 @@ fn render_init_config_content() -> String {
 
 # Default model to use when none is specified
 # This will be used if you don't provide a /model command or --model flag
-# Use short names like "codex", "sonnet", "flash", "gpt4o", etc.
+# Use short names like "sol", "terra", "luna", "sonnet", "flash", "gpt4o", etc.
 default_model = "{default_model}"
+
+# Default reasoning effort for text and chat requests.
+# Values: auto, max, xhigh, high, medium, low, minimal, none.
+# Defaults to "high" when omitted.
+# "auto" leaves the setting to OpenRouter and the selected model.
+# reasoning_effort = "high"
 
 # Enable OpenRouter server-side web search for text and chat requests
 # You can also enable this per request with --web.
@@ -620,20 +573,15 @@ theme = "base16-ocean.dark"
 # [shell]
 # default_action = "ask"   # allow | ask | deny
 # allowed_shells = ["/bin/sh", "/bin/bash", "/bin/zsh"]
-#
-# [[shell.always_on]]
-# action = "allow"
-# terminal = true       # optional: stop evaluating later rules for this match
-# program = "git"
-# args_prefix = [{{ exact = "status" }}]
-#
-# [[shell.policy_sets]]
-# name = "github_cli"
-#
-# [[shell.policy_sets.entries]]
-# action = "allow"
-# program = "gh"
-# args_prefix = [{{ exact = "pr" }}]
+# Policy rules live in ~/.config/zo/policies/.
+# For example, ~/.config/zo/policies/default can contain:
+#   allow git status
+#   deny gh auth **
+#   allow gh pr view /\d+/
+#   #TEST allow git status
+#   #TEST deny gh auth login
+#   #TEST allow gh pr view 100
+#   #TEST default gh pr view abc
 
 # Model mappings (shortname -> OpenRouter model ID)
 # Built-in aliases stay available by default.
@@ -648,21 +596,53 @@ theme = "base16-ocean.dark"
 #
 # Custom model definitions
 # Define virtual model names that map to actual OpenRouter models
-# You can optionally include a system prompt for each custom model
+# You can optionally include a system prompt and reasoning effort for each custom model
 #
 # Example:
 # [[custom_models]]
 # name = "code"
-# model = "anthropic/claude-sonnet-4.5"
+# model = "anthropic/claude-sonnet-5"
 # system_prompt = "You are an expert programmer. Provide concise, well-commented code."
+# reasoning_effort = "high"
 #
 # [[custom_models]]
 # name = "writer"
 # model = "openai/gpt-4o"
 # system_prompt = "You are a professional writer. Write clearly and engagingly."
+
+# Byte-based safety limits. These are not model token limits.
+[limits]
+max_input_bytes = {max_input_bytes}
+max_session_bytes = {max_session_bytes}
 "##,
         default_model = DEFAULT_TEXT_MODEL_NAME,
+        max_input_bytes = DEFAULT_MAX_INPUT_BYTES,
+        max_session_bytes = DEFAULT_MAX_SESSION_BYTES,
     )
+}
+
+fn render_default_policy_content() -> String {
+    r#"# zo shell policy: default
+# This policy is used when --shell is enabled and no --policies value is provided.
+#
+# Rules use:
+#   <allow|ask|deny> <program> <arg-patterns...>
+#
+# Examples:
+#   allow git status
+#   deny gh auth **
+#   allow gh pr view /\d+/
+#
+# Inline tests are checked when shell mode starts.
+# Rules are not allowed after the first #TEST line.
+#
+# Examples:
+#   #TEST allow git status
+#   #TEST deny gh auth login
+#   #TEST allow gh pr view 100
+#   #TEST default gh pr view abc
+"#
+    .to_string()
 }
 
 #[cfg(test)]
@@ -673,25 +653,29 @@ mod tests {
     fn test_validate_config_valid() {
         let config = Config {
             api_key: Some("test-key".to_string()),
-            default_model: Some("codex".to_string()),
+            default_model: Some("sol".to_string()),
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![
                 CustomModel {
                     name: "mymodel".to_string(),
-                    model: "anthropic/claude-3.5-sonnet".to_string(),
+                    model: "anthropic/claude-sonnet-5".to_string(),
                     system_prompt: Some("Test prompt".to_string()),
+                    reasoning_effort: None,
                 },
                 CustomModel {
                     name: "another".to_string(),
                     model: "openai/gpt-4o".to_string(),
                     system_prompt: None,
+                    reasoning_effort: None,
                 },
             ],
             theme: Some("base16-ocean.dark".to_string()),
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: LimitsConfig::default(),
         };
 
         assert!(validate_config(&config).is_ok());
@@ -699,7 +683,7 @@ mod tests {
 
     #[test]
     fn test_web_defaults_false_when_missing() {
-        let config: Config = toml::from_str(r#"default_model = "codex""#).unwrap();
+        let config: Config = toml::from_str(r#"default_model = "sol""#).unwrap();
 
         assert!(!config.web);
     }
@@ -712,21 +696,103 @@ mod tests {
     }
 
     #[test]
+    fn test_reasoning_effort_defaults_unset_when_missing() {
+        let config: Config = toml::from_str("").unwrap();
+
+        assert_eq!(config.reasoning_effort, None);
+    }
+
+    #[test]
+    fn test_reasoning_effort_parses_for_global_and_custom_model() {
+        let config: Config = toml::from_str(
+            r#"
+reasoning_effort = "medium"
+
+[[custom_models]]
+name = "deep"
+model = "anthropic/claude-opus-4.6"
+reasoning_effort = "high"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.reasoning_effort, Some(ReasoningEffort::Medium));
+        assert_eq!(
+            config.custom_models[0].reasoning_effort,
+            Some(ReasoningEffort::High)
+        );
+    }
+
+    #[test]
+    fn test_reasoning_effort_rejects_unknown_value() {
+        let result = toml::from_str::<Config>(r#"reasoning_effort = "extreme""#);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reasoning_effort_parses_all_supported_values() {
+        let cases = [
+            ("auto", ReasoningEffort::Auto),
+            ("max", ReasoningEffort::Max),
+            ("xhigh", ReasoningEffort::Xhigh),
+            ("high", ReasoningEffort::High),
+            ("medium", ReasoningEffort::Medium),
+            ("low", ReasoningEffort::Low),
+            ("minimal", ReasoningEffort::Minimal),
+            ("none", ReasoningEffort::None),
+        ];
+
+        for (value, expected) in cases {
+            let config: Config =
+                toml::from_str(&format!(r#"reasoning_effort = "{value}""#)).unwrap();
+            assert_eq!(config.reasoning_effort, Some(expected));
+        }
+    }
+
+    #[test]
+    fn test_limits_default_when_missing() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.limits, LimitsConfig::default());
+    }
+
+    #[test]
+    fn test_validate_config_rejects_zero_limits() {
+        let mut config = get_default_config();
+        config.limits.max_input_bytes = 0;
+        assert!(validate_config(&config).is_err());
+
+        config.limits.max_input_bytes = DEFAULT_MAX_INPUT_BYTES;
+        config.limits.max_session_bytes = 0;
+        assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_rendered_config_contains_valid_limits() {
+        let content = render_init_config_content();
+        let config: Config = toml::from_str(&content).unwrap();
+        assert_eq!(config.limits, LimitsConfig::default());
+    }
+
+    #[test]
     fn test_validate_config_empty_model_name() {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![CustomModel {
                 name: "".to_string(),
-                model: "anthropic/claude-3.5-sonnet".to_string(),
+                model: "anthropic/claude-sonnet-5".to_string(),
                 system_prompt: None,
+                reasoning_effort: None,
             }],
             theme: None,
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: LimitsConfig::default(),
         };
 
         let result = validate_config(&config);
@@ -739,17 +805,20 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![CustomModel {
                 name: "mymodel".to_string(),
                 model: "".to_string(),
                 system_prompt: None,
+                reasoning_effort: None,
             }],
             theme: None,
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: LimitsConfig::default(),
         };
 
         let result = validate_config(&config);
@@ -762,24 +831,28 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![
                 CustomModel {
                     name: "mymodel".to_string(),
-                    model: "anthropic/claude-3.5-sonnet".to_string(),
+                    model: "anthropic/claude-sonnet-5".to_string(),
                     system_prompt: None,
+                    reasoning_effort: None,
                 },
                 CustomModel {
                     name: "MyModel".to_string(), // Case-insensitive duplicate
                     model: "openai/gpt-4o".to_string(),
                     system_prompt: None,
+                    reasoning_effort: None,
                 },
             ],
             theme: None,
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: LimitsConfig::default(),
         };
 
         let result = validate_config(&config);
@@ -792,6 +865,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: Some(std::collections::HashMap::from([(
                 "sonnet".to_string(),
@@ -802,6 +876,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: LimitsConfig::default(),
         };
 
         let result = validate_config(&config);
@@ -813,6 +888,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: Some(std::collections::HashMap::from([(
                 "myalias".to_string(),
@@ -823,6 +899,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: LimitsConfig::default(),
         };
 
         let result = validate_config(&config);
@@ -840,6 +917,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![],
@@ -847,6 +925,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: LimitsConfig::default(),
         };
 
         let result = validate_config(&config);
@@ -858,6 +937,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![],
@@ -865,6 +945,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: LimitsConfig::default(),
         };
 
         let result = validate_config(&config);
@@ -877,6 +958,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![],
@@ -889,6 +971,7 @@ mod tests {
             }),
             history_file: None,
             shell: ShellConfig::default(),
+            limits: LimitsConfig::default(),
         };
 
         let result = validate_config(&config);
@@ -900,6 +983,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![],
@@ -912,6 +996,7 @@ mod tests {
             }),
             history_file: None,
             shell: ShellConfig::default(),
+            limits: LimitsConfig::default(),
         };
 
         let result = validate_config(&config);
@@ -926,6 +1011,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![],
@@ -938,6 +1024,7 @@ mod tests {
             }),
             history_file: None,
             shell: ShellConfig::default(),
+            limits: LimitsConfig::default(),
         };
 
         let result = validate_config(&config);
@@ -948,10 +1035,11 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_config_rejects_duplicate_shell_policy_sets() {
+    fn test_validate_config_rejects_legacy_shell_policy_sets() {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![],
@@ -959,34 +1047,10 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig {
-                policy_sets: vec![
-                    ShellPolicySet {
-                        name: "git".to_string(),
-                        entries: vec![ShellPolicyEntry {
-                            action: ShellPolicyAction::Allow,
-                            terminal: false,
-                            program: Some("git".to_string()),
-                            args: vec![],
-                            args_prefix: vec![],
-                            command_glob: None,
-                            command_regex: None,
-                        }],
-                    },
-                    ShellPolicySet {
-                        name: "Git".to_string(),
-                        entries: vec![ShellPolicyEntry {
-                            action: ShellPolicyAction::Ask,
-                            terminal: false,
-                            program: Some("git".to_string()),
-                            args: vec![],
-                            args_prefix: vec![],
-                            command_glob: None,
-                            command_regex: None,
-                        }],
-                    },
-                ],
+                policy_sets: vec![toml::Value::Table(toml::map::Map::new())],
                 ..ShellConfig::default()
             },
+            limits: LimitsConfig::default(),
         };
 
         let result = validate_config(&config);
@@ -995,51 +1059,12 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Duplicate shell policy set name")
+                .contains("shell.policy_sets is no longer supported")
         );
     }
 
     #[test]
-    fn test_validate_config_rejects_invalid_shell_arg_regex() {
-        let config = Config {
-            api_key: None,
-            default_model: None,
-            web: false,
-            models: None,
-            custom_models: vec![],
-            theme: None,
-            inline_colors: None,
-            history_file: None,
-            shell: ShellConfig {
-                always_on: vec![ShellPolicyEntry {
-                    action: ShellPolicyAction::Allow,
-                    terminal: false,
-                    program: Some("head".to_string()),
-                    args: vec![ShellArgMatcher {
-                        exact: None,
-                        glob: None,
-                        regex: Some("(".to_string()),
-                    }],
-                    args_prefix: vec![],
-                    command_glob: None,
-                    command_regex: None,
-                }],
-                ..ShellConfig::default()
-            },
-        };
-
-        let result = validate_config(&config);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("invalid regular expression")
-        );
-    }
-
-    #[test]
-    fn test_shell_policy_entry_terminal_defaults_false() {
+    fn test_validate_config_rejects_legacy_shell_always_on() {
         let config: Config = toml::from_str(
             r#"
                 [shell]
@@ -1051,120 +1076,13 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!config.shell.always_on[0].terminal);
-    }
-
-    #[test]
-    fn test_validate_config_accepts_args_prefix() {
-        let config = Config {
-            api_key: None,
-            default_model: None,
-            web: false,
-            models: None,
-            custom_models: vec![],
-            theme: None,
-            inline_colors: None,
-            history_file: None,
-            shell: ShellConfig {
-                always_on: vec![ShellPolicyEntry {
-                    action: ShellPolicyAction::Allow,
-                    terminal: false,
-                    program: Some("git".to_string()),
-                    args: vec![],
-                    args_prefix: vec![ShellArgMatcher {
-                        exact: Some("status".to_string()),
-                        glob: None,
-                        regex: None,
-                    }],
-                    command_glob: None,
-                    command_regex: None,
-                }],
-                ..ShellConfig::default()
-            },
-        };
-
-        assert!(validate_config(&config).is_ok());
-    }
-
-    #[test]
-    fn test_validate_config_rejects_args_and_args_prefix_combination() {
-        let config = Config {
-            api_key: None,
-            default_model: None,
-            web: false,
-            models: None,
-            custom_models: vec![],
-            theme: None,
-            inline_colors: None,
-            history_file: None,
-            shell: ShellConfig {
-                always_on: vec![ShellPolicyEntry {
-                    action: ShellPolicyAction::Allow,
-                    terminal: false,
-                    program: Some("git".to_string()),
-                    args: vec![ShellArgMatcher {
-                        exact: Some("status".to_string()),
-                        glob: None,
-                        regex: None,
-                    }],
-                    args_prefix: vec![ShellArgMatcher {
-                        exact: Some("status".to_string()),
-                        glob: None,
-                        regex: None,
-                    }],
-                    command_glob: None,
-                    command_regex: None,
-                }],
-                ..ShellConfig::default()
-            },
-        };
-
         let result = validate_config(&config);
         assert!(result.is_err());
         assert!(
             result
                 .unwrap_err()
                 .to_string()
-                .contains("cannot combine 'args' with 'args_prefix'")
-        );
-    }
-
-    #[test]
-    fn test_validate_config_rejects_args_prefix_without_program() {
-        let config = Config {
-            api_key: None,
-            default_model: None,
-            web: false,
-            models: None,
-            custom_models: vec![],
-            theme: None,
-            inline_colors: None,
-            history_file: None,
-            shell: ShellConfig {
-                always_on: vec![ShellPolicyEntry {
-                    action: ShellPolicyAction::Allow,
-                    terminal: false,
-                    program: None,
-                    args: vec![],
-                    args_prefix: vec![ShellArgMatcher {
-                        exact: Some("status".to_string()),
-                        glob: None,
-                        regex: None,
-                    }],
-                    command_glob: Some("git *".to_string()),
-                    command_regex: None,
-                }],
-                ..ShellConfig::default()
-            },
-        };
-
-        let result = validate_config(&config);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains(".args_prefix requires a 'program' matcher")
+                .contains("shell.always_on is no longer supported")
         );
     }
 
@@ -1232,12 +1150,18 @@ pub fn save_config(config: &Config) -> Result<()> {
 /// - The file cannot be written
 pub fn init_config() -> Result<()> {
     let config_path = get_config_path()?;
+    let default_policy_path = get_config_dir()?.join("policies").join("default");
 
-    // Check if config already exists
     if config_path.exists() {
         anyhow::bail!(
             "Config file already exists at: {}\nRemove it first if you want to reinitialize.",
             config_path.display()
+        );
+    }
+    if default_policy_path.exists() {
+        anyhow::bail!(
+            "Default policy file already exists at: {}\nRemove it first if you want to reinitialize.",
+            default_policy_path.display()
         );
     }
 
@@ -1254,7 +1178,22 @@ pub fn init_config() -> Result<()> {
     fs::write(&config_path, config_content)
         .with_context(|| format!("Failed to write config file: {}", config_path.display()))?;
 
+    if let Some(parent) = default_policy_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create policy directory: {}", parent.display()))?;
+    }
+    fs::write(&default_policy_path, render_default_policy_content()).with_context(|| {
+        format!(
+            "Failed to write default policy file: {}",
+            default_policy_path.display()
+        )
+    })?;
+
     println!("✓ Config file created at: {}", config_path.display());
+    println!(
+        "✓ Default shell policy created at: {}",
+        default_policy_path.display()
+    );
     println!("\nNext steps:");
     println!("1. Add your OpenRouter API key to the config file");
     println!("   Or set the OPENROUTER_API_KEY environment variable");

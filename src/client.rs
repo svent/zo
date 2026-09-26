@@ -42,6 +42,7 @@ mod tests {
         let config = Config {
             api_key: None,
             default_model: None,
+            reasoning_effort: None,
             web: false,
             models: None,
             custom_models: vec![],
@@ -49,6 +50,7 @@ mod tests {
             inline_colors: None,
             history_file: None,
             shell: ShellConfig::default(),
+            limits: crate::config::LimitsConfig::default(),
         };
 
         let result = create_client(&config);
