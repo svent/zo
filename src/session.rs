@@ -68,6 +68,7 @@ pub struct Session {
     allow_hidden: bool,
     tool_log_mode: ToolLogMode,
     max_session_bytes: usize,
+    max_tool_rounds: usize,
     pending_turn: bool,
     retry_kind: Option<RetryKind>,
     /// Commands denied or rejected earlier in the session
@@ -95,6 +96,7 @@ pub struct SessionOptions {
     pub allow_hidden: bool,
     pub tool_log_mode: ToolLogMode,
     pub max_session_bytes: usize,
+    pub max_tool_rounds: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,8 +168,6 @@ fn determine_tool_availability(
 }
 
 impl Session {
-    /// Maximum number of tool call round-trips before stopping.
-    const MAX_TOOL_ROUNDS: usize = 32;
     /// Some models reject tool-call assistant messages with empty content.
     const EMPTY_TOOL_CALL_PLACEHOLDER: &'static str = "[tool call]";
     /// Prefer one-line tool logs when serialized arguments fit this size.
@@ -194,6 +194,7 @@ impl Session {
             allow_hidden: options.allow_hidden,
             tool_log_mode: options.tool_log_mode,
             max_session_bytes: options.max_session_bytes,
+            max_tool_rounds: options.max_tool_rounds,
             pending_turn: false,
             retry_kind: None,
             failed_shell_calls: HashSet::new(),
@@ -240,7 +241,7 @@ impl Session {
 
         let mut all_response_text = String::new();
 
-        for _round in 0..Self::MAX_TOOL_ROUNDS {
+        for _round in 0..self.max_tool_rounds {
             self.trim_context_to_limit()?;
             let request = self.build_request()?;
             let (response_text, tool_calls) = match self.stream_response(&request).await {
@@ -288,7 +289,7 @@ impl Session {
         self.retry_kind = Some(RetryKind::ToolContinuation);
         anyhow::bail!(
             "Reached the maximum of {} tool-call rounds; the turn can be continued",
-            Self::MAX_TOOL_ROUNDS
+            self.max_tool_rounds
         )
     }
 
@@ -959,8 +960,172 @@ mod tests {
                 allow_hidden: false,
                 tool_log_mode: ToolLogMode::Off,
                 max_session_bytes: crate::config::DEFAULT_MAX_SESSION_BYTES,
+                max_tool_rounds: crate::config::DEFAULT_MAX_TOOL_ROUNDS,
             },
         )
+    }
+
+    async fn mock_streaming_session(
+        deltas: Vec<Value>,
+    ) -> (Session, tokio::task::JoinHandle<Vec<Value>>) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async move {
+                let mut requests = Vec::new();
+                for delta in deltas {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let mut socket = BufReader::new(socket);
+                    let mut content_length = 0;
+                    loop {
+                        let mut line = String::new();
+                        assert!(socket.read_line(&mut line).await.unwrap() > 0);
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some((name, value)) = line.split_once(':')
+                            && name.eq_ignore_ascii_case("content-length")
+                        {
+                            content_length = value.trim().parse::<usize>().unwrap();
+                        }
+                    }
+                    let mut body = vec![0; content_length];
+                    socket.read_exact(&mut body).await.unwrap();
+                    requests.push(serde_json::from_slice::<Value>(&body).unwrap());
+
+                    let chunk = serde_json::json!({
+                        "id": "test-completion",
+                        "object": "chat.completion.chunk",
+                        "created": 0,
+                        "model": "test/model",
+                        "choices": [{
+                            "index": 0,
+                            "finish_reason": if delta.get("tool_calls").is_some() {
+                                "tool_calls"
+                            } else {
+                                "stop"
+                            },
+                            "delta": delta
+                        }]
+                    });
+                    let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket.get_mut().write_all(response.as_bytes()).await.unwrap();
+                }
+                requests
+            })
+            .await
+            .expect("mock streaming server timed out")
+        });
+        let client = OpenRouterClient::builder()
+            .base_url(format!("http://{address}"))
+            .api_key("test")
+            .build()
+            .unwrap();
+        let mut session = test_session_with_client(client);
+        session.tool_access.file_mode = FileToolMode::ReadOnly;
+        (session, server)
+    }
+
+    fn read_file_delta(ids: &[&str]) -> Value {
+        let calls: Vec<Value> = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| {
+                serde_json::json!({
+                    "index": index,
+                    "id": id,
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": r#"{"path":"Cargo.toml","start_line":1,"end_line":2}"#
+                    }
+                })
+            })
+            .collect();
+        serde_json::json!({"tool_calls": calls})
+    }
+
+    #[tokio::test]
+    async fn test_tool_round_limit_and_continuation_preserve_results() {
+        let (mut session, server) = mock_streaming_session(vec![
+            read_file_delta(&["first", "second"]),
+            read_file_delta(&["third"]),
+            serde_json::json!({"content": "Done"}),
+        ])
+        .await;
+        session.max_tool_rounds = 2;
+
+        let error = session
+            .send_message(Message::new(Role::User, "read files"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Reached the maximum of 2 tool-call rounds; the turn can be continued"
+        );
+        assert!(session.pending_turn);
+        assert_eq!(session.retry_kind(), Some(RetryKind::ToolContinuation));
+        let history = serde_json::to_value(&session.messages).unwrap();
+        let results: Vec<_> = history
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .collect();
+        assert_eq!(results.len(), 3);
+        for (result, id) in results.iter().zip(["first", "second", "third"]) {
+            assert_eq!(result["tool_call_id"], id);
+            assert!(result["content"].as_str().unwrap().contains("[package]"));
+        }
+
+        assert_eq!(session.retry_pending().await.unwrap(), "Done");
+        assert!(!session.pending_turn);
+        assert_eq!(session.retry_kind(), None);
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2]["messages"], history);
+        assert_eq!(
+            session.messages.len(),
+            history.as_array().unwrap().len() + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multiple_tool_calls_complete_within_round_limit() {
+        let (mut session, server) = mock_streaming_session(vec![
+            read_file_delta(&["first", "second", "third"]),
+            serde_json::json!({"content": "Done"}),
+        ])
+        .await;
+        session.max_tool_rounds = 2;
+
+        assert_eq!(
+            session
+                .send_message(Message::new(Role::User, "read files"))
+                .await
+                .unwrap(),
+            "Done"
+        );
+        assert!(!session.pending_turn);
+        assert_eq!(session.retry_kind(), None);
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .count(),
+            3
+        );
     }
 
     #[test]

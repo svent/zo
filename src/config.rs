@@ -48,13 +48,14 @@ pub struct Config {
     #[serde(default)]
     pub shell: ShellConfig,
 
-    /// Safety limits for submitted input and retained conversation context.
+    /// Safety limits for input, retained context, and tool rounds.
     #[serde(default)]
     pub limits: LimitsConfig,
 }
 
 pub const DEFAULT_MAX_INPUT_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_SESSION_BYTES: usize = 4 * 1024 * 1024;
+pub const DEFAULT_MAX_TOOL_ROUNDS: usize = 128;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -92,6 +93,8 @@ pub struct LimitsConfig {
     pub max_input_bytes: usize,
     #[serde(default = "default_max_session_bytes")]
     pub max_session_bytes: usize,
+    #[serde(default = "default_max_tool_rounds")]
+    pub max_tool_rounds: usize,
 }
 
 impl Default for LimitsConfig {
@@ -99,6 +102,7 @@ impl Default for LimitsConfig {
         Self {
             max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
             max_session_bytes: DEFAULT_MAX_SESSION_BYTES,
+            max_tool_rounds: DEFAULT_MAX_TOOL_ROUNDS,
         }
     }
 }
@@ -109,6 +113,10 @@ fn default_max_input_bytes() -> usize {
 
 fn default_max_session_bytes() -> usize {
     DEFAULT_MAX_SESSION_BYTES
+}
+
+fn default_max_tool_rounds() -> usize {
+    DEFAULT_MAX_TOOL_ROUNDS
 }
 
 /// Custom model definition
@@ -385,6 +393,9 @@ fn validate_config(config: &Config) -> Result<()> {
     if config.limits.max_session_bytes == 0 {
         anyhow::bail!("limits.max_session_bytes must be greater than zero");
     }
+    if config.limits.max_tool_rounds == 0 {
+        anyhow::bail!("limits.max_tool_rounds must be greater than zero");
+    }
 
     if let Some(models) = &config.models {
         for (name, model_id) in models {
@@ -610,14 +621,16 @@ theme = "base16-ocean.dark"
 # model = "openai/gpt-4o"
 # system_prompt = "You are a professional writer. Write clearly and engagingly."
 
-# Byte-based safety limits. These are not model token limits.
+# Input/context limits count bytes, not model tokens. Tool rounds count model round trips.
 [limits]
 max_input_bytes = {max_input_bytes}
 max_session_bytes = {max_session_bytes}
+max_tool_rounds = {max_tool_rounds}
 "##,
         default_model = DEFAULT_TEXT_MODEL_NAME,
         max_input_bytes = DEFAULT_MAX_INPUT_BYTES,
         max_session_bytes = DEFAULT_MAX_SESSION_BYTES,
+        max_tool_rounds = DEFAULT_MAX_TOOL_ROUNDS,
     )
 }
 
@@ -754,6 +767,18 @@ reasoning_effort = "high"
     fn test_limits_default_when_missing() {
         let config: Config = toml::from_str("").unwrap();
         assert_eq!(config.limits, LimitsConfig::default());
+        assert_eq!(config.limits.max_tool_rounds, 128);
+    }
+
+    #[test]
+    fn test_tool_round_limit_config_compatibility() {
+        let config: Config =
+            toml::from_str("[limits]\nmax_input_bytes = 1024\nmax_session_bytes = 4096").unwrap();
+        assert_eq!(config.limits.max_tool_rounds, 128);
+
+        let config: Config = toml::from_str("[limits]\nmax_tool_rounds = 256").unwrap();
+        assert_eq!(config.limits.max_tool_rounds, 256);
+        validate_config(&config).unwrap();
     }
 
     #[test]
@@ -765,6 +790,13 @@ reasoning_effort = "high"
         config.limits.max_input_bytes = DEFAULT_MAX_INPUT_BYTES;
         config.limits.max_session_bytes = 0;
         assert!(validate_config(&config).is_err());
+
+        config.limits.max_session_bytes = DEFAULT_MAX_SESSION_BYTES;
+        config.limits.max_tool_rounds = 0;
+        assert_eq!(
+            validate_config(&config).unwrap_err().to_string(),
+            "limits.max_tool_rounds must be greater than zero"
+        );
     }
 
     #[test]

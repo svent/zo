@@ -134,6 +134,16 @@ pub fn build_system_prompt(
         instructions.push(parts.join("\n"));
     }
 
+    if tool_access.file_mode != FileToolMode::Disabled
+        || !output_files.is_empty()
+        || tool_access.shell_enabled
+    {
+        instructions.push(
+            "When tool calls are independent and do not require one another's results, request them together in one response. Keep dependent operations in separate rounds."
+                .to_string(),
+        );
+    }
+
     if !instructions.is_empty() {
         let instructions = instructions.join("\n\n");
         if system_prompt.is_empty() {
@@ -269,5 +279,42 @@ mod tests {
         );
         assert!(prompt.contains("run_program"));
         assert!(prompt.contains("normal permissions"));
+    }
+
+    #[test]
+    fn test_batching_guidance_only_with_local_tools() {
+        for (file_mode, shell_enabled, outputs, expected) in [
+            (FileToolMode::Disabled, false, vec![], false),
+            (FileToolMode::ReadOnly, false, vec![], true),
+            (FileToolMode::ReadWrite, false, vec![], true),
+            (
+                FileToolMode::Disabled,
+                false,
+                vec![output("out.txt", false)],
+                true,
+            ),
+            (FileToolMode::Disabled, true, vec![], true),
+            (FileToolMode::ReadWrite, true, vec![], true),
+        ] {
+            let prompt = build_system_prompt(
+                &model(),
+                &outputs,
+                ToolAccess {
+                    file_mode,
+                    shell_enabled,
+                },
+                false,
+            );
+            assert_eq!(
+                prompt
+                    .matches("request them together in one response")
+                    .count(),
+                usize::from(expected)
+            );
+            assert_eq!(
+                prompt.contains("Keep dependent operations in separate rounds."),
+                expected
+            );
+        }
     }
 }

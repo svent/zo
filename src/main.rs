@@ -117,6 +117,10 @@ struct Cli {
     /// Maximum serialized conversation bytes retained for an API request
     #[arg(long, value_name = "BYTES")]
     max_session_bytes: Option<usize>,
+
+    /// Maximum tool-call rounds per turn continuation (default: 128)
+    #[arg(long, value_name = "N", conflicts_with = "image")]
+    max_tool_rounds: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +162,7 @@ fn parse_action(cli: &Cli) -> Result<Option<Action>> {
         || cli.hidden
         || cli.max_input_bytes.is_some()
         || cli.max_session_bytes.is_some()
+        || cli.max_tool_rounds.is_some()
     {
         bail!("{} must be used as a standalone action", first);
     }
@@ -256,6 +261,14 @@ fn resolve_image_model(
             true,
         ))
     }
+}
+
+fn resolve_max_tool_rounds(cli_value: Option<usize>, config_value: usize) -> Result<usize> {
+    let limit = cli_value.unwrap_or(config_value);
+    if limit == 0 {
+        bail!("--max-tool-rounds must be greater than zero");
+    }
+    Ok(limit)
 }
 
 fn resolve_reasoning_effort(
@@ -634,6 +647,8 @@ async fn main() -> Result<()> {
     // Load configuration
     let config = config::load_config().context("Failed to load configuration")?;
     let max_input_bytes = cli.max_input_bytes.unwrap_or(config.limits.max_input_bytes);
+    let max_tool_rounds =
+        resolve_max_tool_rounds(cli.max_tool_rounds, config.limits.max_tool_rounds)?;
     let max_session_bytes = cli
         .max_session_bytes
         .unwrap_or(config.limits.max_session_bytes);
@@ -769,6 +784,7 @@ async fn main() -> Result<()> {
                     allow_hidden: cli.hidden,
                     tool_log_mode,
                     max_session_bytes,
+                    max_tool_rounds,
                 },
                 history_file: config.history_file,
                 max_input_bytes,
@@ -814,6 +830,7 @@ async fn main() -> Result<()> {
                 allow_hidden: cli.hidden,
                 tool_log_mode,
                 max_session_bytes,
+                max_tool_rounds,
             },
         );
 
@@ -1035,11 +1052,37 @@ mod tests {
             "1024",
             "--max-session-bytes",
             "4096",
+            "--max-tool-rounds",
+            "256",
             "hello",
         ])
         .unwrap();
         assert_eq!(cli.max_input_bytes, Some(1024));
         assert_eq!(cli.max_session_bytes, Some(4096));
+        assert_eq!(cli.max_tool_rounds, Some(256));
+    }
+
+    #[test]
+    fn test_tool_round_limit_precedence_and_validation() {
+        assert_eq!(resolve_max_tool_rounds(Some(256), 32).unwrap(), 256);
+        assert_eq!(resolve_max_tool_rounds(None, 32).unwrap(), 32);
+        assert_eq!(
+            resolve_max_tool_rounds(Some(0), 32)
+                .unwrap_err()
+                .to_string(),
+            "--max-tool-rounds must be greater than zero"
+        );
+    }
+
+    #[test]
+    fn test_tool_round_limit_conflicts() {
+        assert!(
+            Cli::try_parse_from(["zo", "--max-tool-rounds", "2", "--image", "out.png"]).is_err()
+        );
+        for action in ["+init-config", "+list-models"] {
+            let cli = Cli::try_parse_from(["zo", "--max-tool-rounds", "2", action]).unwrap();
+            assert!(parse_action(&cli).is_err());
+        }
     }
 
     #[test]
