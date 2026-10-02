@@ -467,6 +467,7 @@ impl Session {
         let mut result_tool_calls: Vec<ToolCall> = Vec::new();
         let mut leading_probe = String::new();
         let mut probing_placeholder = true;
+        let mut stripped_placeholder = false;
 
         let mut stream = self
             .client
@@ -488,8 +489,21 @@ impl Session {
                     if probing_placeholder {
                         leading_probe.push_str(&text);
 
-                        if Self::EMPTY_TOOL_CALL_PLACEHOLDER.starts_with(leading_probe.as_str())
-                            && leading_probe.len() <= Self::EMPTY_TOOL_CALL_PLACEHOLDER.len()
+                        // Tool-call placeholders may be echoed repeatedly across chunks.
+                        while let Some(rest) = leading_probe
+                            .trim_start()
+                            .strip_prefix(Self::EMPTY_TOOL_CALL_PLACEHOLDER)
+                        {
+                            let consumed = leading_probe.len() - rest.len();
+                            leading_probe.drain(..consumed);
+                            stripped_placeholder = true;
+                        }
+                        if stripped_placeholder {
+                            let whitespace = leading_probe.len() - leading_probe.trim_start().len();
+                            leading_probe.drain(..whitespace);
+                        }
+
+                        if Self::EMPTY_TOOL_CALL_PLACEHOLDER.starts_with(leading_probe.trim_start())
                         {
                             continue;
                         }
@@ -530,7 +544,7 @@ impl Session {
             }
         }
 
-        if probing_placeholder && leading_probe != Self::EMPTY_TOOL_CALL_PLACEHOLDER {
+        if probing_placeholder {
             accumulated_text.push_str(&leading_probe);
             renderer
                 .add_chunk(&leading_probe)
