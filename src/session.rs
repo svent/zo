@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use openrouter_rs::OpenRouterClient;
 use openrouter_rs::api::chat::{ChatCompletionRequest, ContentPart, Message};
-use openrouter_rs::types::completion::FinishReason;
+use openrouter_rs::types::completion::{FinishReason, ReasoningDetail};
 use openrouter_rs::types::stream::StreamEvent;
 use openrouter_rs::types::typed_tool::TypedTool;
 use openrouter_rs::types::{Effort, Role, ServerTool, ToolCall};
@@ -141,6 +141,51 @@ fn openrouter_reasoning_effort(effort: ReasoningEffort) -> Option<Effort> {
     }
 }
 
+/// Merge a streamed reasoning fragment into the blocks accumulated so far.
+///
+/// Fragments of one block share `index` and `type`: text, summary, and data
+/// arrive in pieces, while the signature and identifiers arrive once.
+fn merge_reasoning_detail(details: &mut Vec<ReasoningDetail>, fragment: ReasoningDetail) {
+    let existing = match fragment.index {
+        Some(index) => details
+            .iter_mut()
+            .find(|d| d.index == Some(index) && d.block_type == fragment.block_type),
+        None => details
+            .last_mut()
+            .filter(|d| d.index.is_none() && d.block_type == fragment.block_type),
+    };
+    let Some(existing) = existing else {
+        details.push(fragment);
+        return;
+    };
+
+    fn append(target: &mut Option<String>, piece: Option<String>) {
+        if let Some(piece) = piece {
+            target.get_or_insert_with(String::new).push_str(&piece);
+        }
+    }
+    append(&mut existing.text, fragment.text);
+    append(&mut existing.summary, fragment.summary);
+    append(&mut existing.data, fragment.data);
+    if fragment.signature.as_deref().is_some_and(|s| !s.is_empty()) {
+        existing.signature = fragment.signature;
+    }
+    existing.format = existing.format.take().or(fragment.format);
+    existing.id = existing.id.take().or(fragment.id);
+    existing.tool_call_id = existing.tool_call_id.take().or(fragment.tool_call_id);
+    existing.tool_name = existing.tool_name.take().or(fragment.tool_name);
+    existing.arguments = existing.arguments.take().or(fragment.arguments);
+    existing.result = existing.result.take().or(fragment.result);
+}
+
+/// Attach reasoning details so the provider can resume the model's reasoning next round.
+fn with_reasoning_details(mut message: Message, details: Vec<ReasoningDetail>) -> Message {
+    if !details.is_empty() {
+        message.reasoning_details = Some(details);
+    }
+    message
+}
+
 fn determine_tool_availability(
     tool_access: ToolAccess,
     output_files: &[OutputFileSpec],
@@ -244,19 +289,20 @@ impl Session {
         for _round in 0..self.max_tool_rounds {
             self.trim_context_to_limit()?;
             let request = self.build_request()?;
-            let (response_text, tool_calls) = match self.stream_response(&request).await {
-                Ok(response) => response,
-                Err(error) => {
-                    if let Some(stream_failure) = error.downcast_ref::<StreamFailure>() {
-                        self.retry_kind = Some(if stream_failure.partial_output {
-                            RetryKind::PartialStream
-                        } else {
-                            RetryKind::Stream
-                        });
+            let (response_text, tool_calls, reasoning_details) =
+                match self.stream_response(&request).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        if let Some(stream_failure) = error.downcast_ref::<StreamFailure>() {
+                            self.retry_kind = Some(if stream_failure.partial_output {
+                                RetryKind::PartialStream
+                            } else {
+                                RetryKind::Stream
+                            });
+                        }
+                        return Err(error);
                     }
-                    return Err(error);
-                }
-            };
+                };
 
             if !response_text.is_empty() {
                 if !all_response_text.is_empty() {
@@ -266,8 +312,10 @@ impl Session {
             }
 
             if tool_calls.is_empty() {
-                self.messages
-                    .push(Message::new(Role::Assistant, response_text.as_str()));
+                self.messages.push(with_reasoning_details(
+                    Message::new(Role::Assistant, response_text.as_str()),
+                    reasoning_details,
+                ));
                 self.pending_turn = false;
                 self.retry_kind = None;
                 return Ok(all_response_text);
@@ -278,9 +326,9 @@ impl Session {
             } else {
                 response_text.as_str()
             };
-            self.messages.push(Message::assistant_with_tool_calls(
-                assistant_content,
-                tool_calls.clone(),
+            self.messages.push(with_reasoning_details(
+                Message::assistant_with_tool_calls(assistant_content, tool_calls.clone()),
+                reasoning_details,
             ));
 
             self.execute_tool_calls(&tool_calls).await?;
@@ -451,11 +499,11 @@ impl Session {
             .context("Failed to build chat completion request")
     }
 
-    /// Stream response, render progressively, and return text + any tool calls.
+    /// Stream response, render progressively, and return text, tool calls, and reasoning details.
     async fn stream_response(
         &self,
         request: &ChatCompletionRequest,
-    ) -> Result<(String, Vec<ToolCall>)> {
+    ) -> Result<(String, Vec<ToolCall>, Vec<ReasoningDetail>)> {
         let is_terminal = io::stdout().is_terminal();
 
         let mut renderer = if is_terminal {
@@ -466,6 +514,7 @@ impl Session {
 
         let mut accumulated_text = String::new();
         let mut result_tool_calls: Vec<ToolCall> = Vec::new();
+        let mut reasoning_details: Vec<ReasoningDetail> = Vec::new();
         let mut leading_probe = String::new();
         let mut probing_placeholder = true;
         let mut stripped_placeholder = false;
@@ -539,8 +588,13 @@ impl Session {
                     stream_error = Some(e.to_string());
                     break;
                 }
+                StreamEvent::ReasoningDetailsDelta(details) => {
+                    for detail in details {
+                        merge_reasoning_detail(&mut reasoning_details, detail);
+                    }
+                }
                 _ => {
-                    // ReasoningDelta, ReasoningDetailsDelta -- ignore for now
+                    // ReasoningDelta -- plain text only; reasoning details are what gets replayed
                 }
             }
         }
@@ -572,7 +626,7 @@ impl Session {
             }));
         }
 
-        Ok((accumulated_text, result_tool_calls))
+        Ok((accumulated_text, result_tool_calls, reasoning_details))
     }
 
     /// Execute tool calls and append tool responses to history.
@@ -968,6 +1022,13 @@ mod tests {
     async fn mock_streaming_session(
         deltas: Vec<Value>,
     ) -> (Session, tokio::task::JoinHandle<Vec<Value>>) {
+        mock_streaming_session_chunks(deltas.into_iter().map(|delta| vec![delta]).collect()).await
+    }
+
+    /// Like `mock_streaming_session`, but each response streams several delta chunks.
+    async fn mock_streaming_session_chunks(
+        responses: Vec<Vec<Value>>,
+    ) -> (Session, tokio::task::JoinHandle<Vec<Value>>) {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         use tokio::net::TcpListener;
 
@@ -976,7 +1037,7 @@ mod tests {
         let server = tokio::spawn(async move {
             tokio::time::timeout(std::time::Duration::from_secs(10), async move {
                 let mut requests = Vec::new();
-                for delta in deltas {
+                for deltas in responses {
                     let (socket, _) = listener.accept().await.unwrap();
                     let mut socket = BufReader::new(socket);
                     let mut content_length = 0;
@@ -996,22 +1057,28 @@ mod tests {
                     socket.read_exact(&mut body).await.unwrap();
                     requests.push(serde_json::from_slice::<Value>(&body).unwrap());
 
-                    let chunk = serde_json::json!({
-                        "id": "test-completion",
-                        "object": "chat.completion.chunk",
-                        "created": 0,
-                        "model": "test/model",
-                        "choices": [{
-                            "index": 0,
-                            "finish_reason": if delta.get("tool_calls").is_some() {
-                                "tool_calls"
-                            } else {
-                                "stop"
-                            },
-                            "delta": delta
-                        }]
-                    });
-                    let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+                    let finish_reason = if deltas.iter().any(|d| d.get("tool_calls").is_some()) {
+                        "tool_calls"
+                    } else {
+                        "stop"
+                    };
+                    let last = deltas.len() - 1;
+                    let mut body = String::new();
+                    for (position, delta) in deltas.into_iter().enumerate() {
+                        let chunk = serde_json::json!({
+                            "id": "test-completion",
+                            "object": "chat.completion.chunk",
+                            "created": 0,
+                            "model": "test/model",
+                            "choices": [{
+                                "index": 0,
+                                "finish_reason": (position == last).then_some(finish_reason),
+                                "delta": delta
+                            }]
+                        });
+                        body.push_str(&format!("data: {chunk}\n\n"));
+                    }
+                    body.push_str("data: [DONE]\n\n");
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
@@ -1126,6 +1193,92 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    fn reasoning_fragment(value: Value) -> ReasoningDetail {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn test_merge_reasoning_detail_assembles_streamed_blocks() {
+        let mut details = Vec::new();
+        for fragment in [
+            serde_json::json!({"type": "reasoning.text", "text": "Let me ", "format": "anthropic-claude-v1", "index": 0}),
+            serde_json::json!({"type": "reasoning.text", "text": "check.", "format": "anthropic-claude-v1", "index": 0}),
+            serde_json::json!({"type": "reasoning.text", "signature": "sig", "format": "anthropic-claude-v1", "index": 0}),
+            serde_json::json!({"type": "reasoning.summary", "summary": "Plan", "index": 1}),
+            serde_json::json!({"type": "reasoning.encrypted", "data": "enc", "id": "rs_1", "index": 1}),
+        ] {
+            merge_reasoning_detail(&mut details, reasoning_fragment(fragment));
+        }
+
+        assert_eq!(
+            serde_json::to_value(&details).unwrap(),
+            serde_json::json!([
+                {"type": "reasoning.text", "text": "Let me check.", "signature": "sig", "format": "anthropic-claude-v1", "index": 0},
+                {"type": "reasoning.summary", "summary": "Plan", "index": 1},
+                {"type": "reasoning.encrypted", "data": "enc", "id": "rs_1", "index": 1}
+            ])
+        );
+    }
+
+    #[test]
+    fn test_merge_reasoning_detail_without_index_joins_trailing_block() {
+        let mut details = Vec::new();
+        for fragment in [
+            serde_json::json!({"type": "reasoning.text", "text": "a"}),
+            serde_json::json!({"type": "reasoning.text", "text": "b"}),
+            serde_json::json!({"type": "reasoning.encrypted", "data": "x"}),
+            serde_json::json!({"type": "reasoning.text", "text": "c"}),
+        ] {
+            merge_reasoning_detail(&mut details, reasoning_fragment(fragment));
+        }
+
+        let texts: Vec<_> = details.iter().map(|d| d.content().unwrap()).collect();
+        assert_eq!(texts, ["ab", "x", "c"]);
+    }
+
+    #[tokio::test]
+    async fn test_reasoning_details_are_replayed_after_tool_calls() {
+        let mut tool_call_chunks = vec![
+            serde_json::json!({"reasoning_details": [{"type": "reasoning.text", "text": "Read ", "format": "anthropic-claude-v1", "index": 0}]}),
+            serde_json::json!({"reasoning_details": [{"type": "reasoning.text", "text": "it.", "format": "anthropic-claude-v1", "index": 0}]}),
+            serde_json::json!({"reasoning_details": [{"type": "reasoning.text", "signature": "sig", "format": "anthropic-claude-v1", "index": 0}]}),
+        ];
+        tool_call_chunks.push(read_file_delta(&["first"]));
+        let (mut session, server) = mock_streaming_session_chunks(vec![
+            tool_call_chunks,
+            vec![serde_json::json!({"content": "Done"})],
+        ])
+        .await;
+
+        assert_eq!(
+            session
+                .send_message(Message::new(Role::User, "read files"))
+                .await
+                .unwrap(),
+            "Done"
+        );
+
+        let requests = server.await.unwrap();
+        let replayed: Vec<_> = requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "assistant")
+            .collect();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0]["tool_calls"][0]["id"], "first");
+        assert_eq!(
+            replayed[0]["reasoning_details"],
+            serde_json::json!([
+                {"type": "reasoning.text", "text": "Read it.", "signature": "sig", "format": "anthropic-claude-v1", "index": 0}
+            ])
+        );
+
+        let final_answer = serde_json::to_value(session.messages.last().unwrap()).unwrap();
+        assert_eq!(final_answer["content"], "Done");
+        assert!(final_answer.get("reasoning_details").is_none());
     }
 
     #[test]
