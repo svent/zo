@@ -51,12 +51,12 @@ impl fmt::Display for ModelSelectionError {
 impl Error for ModelSelectionError {}
 
 pub const DEFAULT_TEXT_MODEL_NAME: &str = "sol";
-pub const DEFAULT_TEXT_MODEL_ID: &str = "openai/gpt-6-sol";
+pub const DEFAULT_TEXT_MODEL_ID: &str = "openai/gpt-6.1-sol";
 
 /// Default models mapping short names to OpenRouter model IDs
 pub const DEFAULT_MODELS: &[(&str, &str)] = &[
     (DEFAULT_TEXT_MODEL_NAME, DEFAULT_TEXT_MODEL_ID),
-    ("terra", "openai/gpt-5.6-terra"),
+    ("terra", "openai/gpt-6.1-terra"),
     ("luna", "openai/gpt-6-luna"),
     ("flash", "google/gemini-3.8-flash"),
     ("glm", "z-ai/glm-5.3"),
@@ -65,13 +65,12 @@ pub const DEFAULT_MODELS: &[(&str, &str)] = &[
     ("gpt4o", "openai/gpt-4o"),
     ("gpt4omini", "openai/gpt-4o-mini"),
     ("grok", "x-ai/grok-4.7"),
-    ("haiku", "anthropic/claude-3-haiku"),
-    ("o1", "openai/o1"),
+    ("haiku", "anthropic/claude-haiku-5.5"),
     ("opus", "anthropic/claude-opus-5.5"),
     ("fable", "anthropic/claude-fable-5.1"),
-    ("sonnet", "anthropic/claude-sonnet-5"),
+    ("sonnet", "anthropic/claude-sonnet-5.5"),
     // image models
-    ("banana", "google/gemini-3-pro-image"),
+    ("banana", "google/gemini-nano-banana-2.1"),
 ];
 
 struct ResolvedBaseModels {
@@ -485,6 +484,8 @@ mod tests {
         assert!(model_map.contains_key("flash"));
         assert!(model_map.contains_key("gpt4o"));
         assert!(!model_map.contains_key("sonnet3"));
+        assert!(!model_map.contains_key("o1"));
+        assert_eq!(model_map.len(), 15);
 
         // Verify model IDs
         assert_eq!(
@@ -493,7 +494,7 @@ mod tests {
         );
         assert_eq!(
             model_map.get("sonnet").unwrap().model_id,
-            "anthropic/claude-sonnet-5"
+            "anthropic/claude-sonnet-5.5"
         );
         assert_eq!(
             model_map.get("opus").unwrap().model_id,
@@ -581,7 +582,7 @@ mod tests {
         // Test exact match
         let result = select_model("sonnet", &model_map, &config);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().model_id, "anthropic/claude-sonnet-5");
+        assert_eq!(result.unwrap().model_id, "anthropic/claude-sonnet-5.5");
     }
 
     #[test]
@@ -651,11 +652,11 @@ mod tests {
         // Test case insensitive exact match
         let result = select_model("SONNET", &model_map, &config);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().model_id, "anthropic/claude-sonnet-5");
+        assert_eq!(result.unwrap().model_id, "anthropic/claude-sonnet-5.5");
 
         let result2 = select_model("SoNnEt", &model_map, &config);
         assert!(result2.is_some());
-        assert_eq!(result2.unwrap().model_id, "anthropic/claude-sonnet-5");
+        assert_eq!(result2.unwrap().model_id, "anthropic/claude-sonnet-5.5");
     }
 
     #[test]

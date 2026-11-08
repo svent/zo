@@ -477,7 +477,7 @@ fn validate_config(config: &Config) -> Result<()> {
 ///
 /// Returns a config with:
 /// - No API key (must be provided via env var or config file)
-/// - Default model: "sol" (OpenAI GPT-5.6 Sol)
+/// - Default model: "sol" (OpenAI GPT-6.1 Sol)
 /// - No custom model mappings (uses built-in defaults)
 /// - Empty custom models list
 /// - Default theme: "base16-ocean.dark" (good for dark terminals)
@@ -612,7 +612,7 @@ theme = "base16-ocean.dark"
 # Example:
 # [[custom_models]]
 # name = "code"
-# model = "anthropic/claude-sonnet-5"
+# model = "anthropic/claude-sonnet-5.5"
 # system_prompt = "You are an expert programmer. Provide concise, well-commented code."
 # reasoning_effort = "high"
 #
