@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.8.0]
+
+### Added
+- Configurable tool-call round limit via `[limits].max_tool_rounds` and the `--max-tool-rounds` CLI override
+
+### Changed
+- Default tool-call round limit increased from 32 to 128 model round trips per turn continuation, rather than per individual tool call
+- Default text model updated from `openai/gpt-6-sol` to `openai/gpt-6.1-sol`
+- Built-in `terra` alias updated from `openai/gpt-5.6-terra` to `openai/gpt-6.1-terra`
+- Built-in `haiku` and `sonnet` aliases updated to `anthropic/claude-haiku-5.5` and `anthropic/claude-sonnet-5.5`
+- Built-in `banana` image alias updated from `google/gemini-3-pro-image` to `google/gemini-nano-banana-2.1`
+- Updated `openrouter-rs` from 0.12.0 to 0.22.0 and refreshed dependencies
+
+### Improved
+- Streamed reasoning fragments are merged and retained in assistant messages, preserving text, summaries, encrypted data, signatures, and metadata across tool-call rounds
+- Repeated leading `[tool call]` placeholders are stripped from streamed output, including placeholders split across chunks or separated by whitespace
+- System prompts now encourage requesting independent tool calls together while keeping dependent operations in separate rounds
+- Expanded regression coverage for tool-round configuration, continuation with preserved tool results, batched tool calls, and reasoning fragment merging and replay
+
+### Removed
+- Built-in `o1` model alias
+
 ## [0.7.0]
 
 ### Added
