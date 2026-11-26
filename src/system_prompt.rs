@@ -41,7 +41,8 @@ pub fn build_system_prompt(
                 }
                 if !read_write_files.is_empty() {
                     parts.push(format!(
-                        "Read-write files (`@!file`): {}. Allowed write tools: write_file, edit_file, replace_lines.",
+                        "Read-write files (`@!file`): {}. Allowed write tools: write_file, edit_file, replace_lines. \
+                         Re-read them with read_file(path, start_line, end_line, line_numbers); no other files are readable.",
                         read_write_files.join(", ")
                     ));
                 }
@@ -61,7 +62,7 @@ pub fn build_system_prompt(
         FileToolMode::ReadOnly => {
             let mut parts = vec![
                 "IMPORTANT: Tool mode is enabled in constrained mode.".to_string(),
-                "Read tools available: list_files(path), find(glob), grep_regex(pattern, path_glob), grep_exact(text, path_glob), read_file(path, start_line, end_line).".to_string(),
+                "Read tools available: list_files(path), find(glob), grep_regex(pattern, path_glob), grep_exact(text, path_glob), read_file(path, start_line, end_line, line_numbers).".to_string(),
                 "Use tools sparingly and with narrow queries; outputs are truncated for safety.".to_string(),
             ];
             if !allow_hidden {
@@ -124,6 +125,13 @@ pub fn build_system_prompt(
 
     if let Some(file_instructions) = file_instructions {
         instructions.push(file_instructions);
+    }
+
+    if tool_access.file_mode == FileToolMode::ReadWrite || !read_write_files.is_empty() {
+        instructions.push(
+            "Line numbers shift after edits. Re-read with read_file before using replace_lines on an edited file."
+                .to_string(),
+        );
     }
 
     if tool_access.shell_enabled {
@@ -202,6 +210,7 @@ mod tests {
         assert!(prompt.contains("write_file"));
         assert!(prompt.contains("a.txt"));
         assert!(!prompt.contains("edit_file"));
+        assert!(!prompt.contains("read_file"));
     }
 
     #[test]
@@ -220,6 +229,8 @@ mod tests {
         assert!(prompt.contains("rw.txt"));
         assert!(prompt.contains("edit_file"));
         assert!(prompt.contains("replace_lines"));
+        assert!(prompt.contains("read_file"));
+        assert!(prompt.contains("Line numbers shift after edits"));
     }
 
     #[test]

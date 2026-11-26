@@ -123,6 +123,7 @@ impl Error for StreamFailure {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ToolAvailability {
     read_tools: bool,
+    read_file: bool,
     write_file: bool,
     edit_tools: bool,
     shell_tools: bool,
@@ -190,21 +191,25 @@ fn determine_tool_availability(
     tool_access: ToolAccess,
     output_files: &[OutputFileSpec],
 ) -> ToolAvailability {
+    let has_read_write_files = output_files.iter().any(|f| f.include_as_input);
     match tool_access.file_mode {
         FileToolMode::Disabled => ToolAvailability {
             read_tools: false,
+            read_file: has_read_write_files,
             write_file: !output_files.is_empty(),
-            edit_tools: output_files.iter().any(|f| f.include_as_input),
+            edit_tools: has_read_write_files,
             shell_tools: tool_access.shell_enabled,
         },
         FileToolMode::ReadOnly => ToolAvailability {
             read_tools: true,
+            read_file: true,
             write_file: !output_files.is_empty(),
-            edit_tools: output_files.iter().any(|f| f.include_as_input),
+            edit_tools: has_read_write_files,
             shell_tools: tool_access.shell_enabled,
         },
         FileToolMode::ReadWrite => ToolAvailability {
             read_tools: true,
+            read_file: true,
             write_file: true,
             edit_tools: true,
             shell_tools: tool_access.shell_enabled,
@@ -473,6 +478,9 @@ impl Session {
             builder.tool(FindParams::create_tool());
             builder.tool(GrepRegexParams::create_tool());
             builder.tool(GrepExactParams::create_tool());
+        }
+
+        if availability.read_file {
             builder.tool(ReadFileParams::create_tool());
         }
 
@@ -754,16 +762,20 @@ impl Session {
                 run_grep_exact(&params.text, &params.path_glob, self.allow_hidden)
             }
             "read_file" => {
-                if !availability.read_tools {
+                if !availability.read_file {
                     return Ok("Tool 'read_file' is not available in current mode.".to_string());
                 }
                 let params = tool_call
                     .parse_params::<ReadFileParams>()
                     .context("Invalid read_file parameters")?;
+                let allowed_files = (self.tool_access.file_mode == FileToolMode::Disabled)
+                    .then(|| self.output_edit_paths());
                 run_read_file(
                     &params.path,
                     params.start_line,
                     params.end_line,
+                    params.line_numbers.unwrap_or(true),
+                    allowed_files.as_deref(),
                     self.allow_hidden,
                 )
             }
@@ -916,6 +928,14 @@ pub fn build_user_message(
                     "<file name=\"{}\">\n{}\n</file>",
                     file_ref.filename, content
                 )),
+                FileReferenceKind::PartialText {
+                    content,
+                    shown_lines,
+                    total_lines,
+                } => Some(format!(
+                    "Note: {name} is too large to include in full. Only its first {shown_lines} of {total_lines} lines are shown below. Use read_file with start_line and end_line to read the rest.\n<file name=\"{name}\">\n{content}\n</file>",
+                    name = file_ref.filename
+                )),
                 FileReferenceKind::Attachment { .. } => None,
             })
             .collect::<Vec<_>>()
@@ -951,7 +971,7 @@ pub fn build_typed_user_message(
                 mime_type.as_str(),
                 data_url.as_str(),
             )),
-            FileReferenceKind::Text(_) => None,
+            FileReferenceKind::Text(_) | FileReferenceKind::PartialText { .. } => None,
         });
 
     if !file_references
@@ -1306,6 +1326,23 @@ mod tests {
     }
 
     #[test]
+    fn test_build_user_message_with_partial_file() {
+        let files = vec![FileReference {
+            filename: "big.rs".to_string(),
+            kind: FileReferenceKind::PartialText {
+                content: "fn main() {}\n".to_string(),
+                shown_lines: 1,
+                total_lines: 5400,
+            },
+        }];
+        let msg = build_user_message(&files, "update this", None);
+        assert!(msg.starts_with("Note: big.rs is too large to include in full."));
+        assert!(msg.contains("first 1 of 5400 lines"));
+        assert!(msg.contains("read_file"));
+        assert!(msg.contains("<file name=\"big.rs\">\nfn main() {}\n"));
+    }
+
+    #[test]
     fn test_build_user_message_all_parts() {
         let files = vec![FileReference {
             filename: "data.csv".to_string(),
@@ -1360,6 +1397,7 @@ mod tests {
             &[],
         );
         assert!(!availability.read_tools);
+        assert!(!availability.read_file);
         assert!(!availability.write_file);
         assert!(!availability.edit_tools);
         assert!(!availability.shell_tools);
@@ -1380,6 +1418,7 @@ mod tests {
             &[output],
         );
         assert!(!availability.read_tools);
+        assert!(!availability.read_file);
         assert!(availability.write_file);
         assert!(!availability.edit_tools);
     }
@@ -1399,6 +1438,7 @@ mod tests {
             &[output],
         );
         assert!(!availability.read_tools);
+        assert!(availability.read_file);
         assert!(availability.write_file);
         assert!(availability.edit_tools);
     }
@@ -1418,6 +1458,7 @@ mod tests {
             &[output],
         );
         assert!(availability.read_tools);
+        assert!(availability.read_file);
         assert!(availability.write_file);
         assert!(availability.edit_tools);
     }

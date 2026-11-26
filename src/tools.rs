@@ -158,6 +158,8 @@ pub struct ReadFileParams {
     pub start_line: Option<usize>,
     /// 1-based end line inclusive (optional)
     pub end_line: Option<usize>,
+    /// Prefix each line with its line number (default: true). Prefixes are not part of the file content.
+    pub line_numbers: Option<bool>,
 }
 
 impl TypedTool for ReadFileParams {
@@ -583,15 +585,29 @@ pub fn run_grep_exact(text: &str, path_glob: &str, allow_hidden: bool) -> Result
     run_grep(text, path_glob, true, allow_hidden)
 }
 
+/// Read a file as numbered or raw lines.
+///
+/// `allowed_files` restricts reads to these normalized paths; `None` allows the whole workspace.
 pub fn run_read_file(
     path: &str,
     start_line: Option<usize>,
     end_line: Option<usize>,
+    line_numbers: bool,
+    allowed_files: Option<&[String]>,
     allow_hidden: bool,
 ) -> Result<String> {
     let resolved = resolve_workspace_path(path, false)
         .with_context(|| format!("Invalid path for read_file: {}", path))?;
     enforce_tool_path_policy(&resolved, path, allow_hidden)?;
+
+    if let Some(allowed_files) = allowed_files
+        && !allowed_files.contains(&resolved.to_string_lossy().to_string())
+    {
+        bail!(
+            "Security: File '{}' is not in allowed list for read_file.",
+            path
+        );
+    }
 
     if !resolved.is_file() {
         bail!("Path is not a readable file: {}", path);
@@ -643,7 +659,12 @@ pub fn run_read_file(
 
     let mut rendered = String::new();
     for (line_num, line) in &selected {
-        rendered.push_str(&format!("{:>6}: {}\n", line_num, line));
+        if line_numbers {
+            rendered.push_str(&format!("{:>6}: {}\n", line_num, line));
+        } else {
+            rendered.push_str(line);
+            rendered.push('\n');
+        }
     }
 
     if rendered.chars().count() > MAX_READ_FILE_CHARS {
@@ -753,12 +774,46 @@ mod tests {
         writeln!(file, "line2").unwrap();
         writeln!(file, "line3").unwrap();
 
-        let out = run_read_file(test_file, Some(2), Some(3), false).unwrap();
+        let out = run_read_file(test_file, Some(2), Some(3), true, None, false).unwrap();
         assert!(out.contains("2: line2"));
         assert!(out.contains("3: line3"));
         assert!(!out.contains("1: line1"));
 
         fs::remove_file(test_file).ok();
+    }
+
+    #[test]
+    fn test_run_read_file_without_line_numbers() {
+        let test_file = "test_tool_read_file_raw.txt";
+        fs::write(test_file, "line1\nline2\n").unwrap();
+
+        let out = run_read_file(test_file, None, None, false, None, false).unwrap();
+        fs::remove_file(test_file).ok();
+
+        assert!(out.ends_with("\nline1\nline2\n"));
+        assert!(!out.contains("1: line1"));
+    }
+
+    #[test]
+    fn test_run_read_file_restricted_to_allowed_files() {
+        let allowed_file = "test_tool_read_file_allowed.txt";
+        let other_file = "test_tool_read_file_other.txt";
+        fs::write(allowed_file, "allowed\n").unwrap();
+        fs::write(other_file, "other\n").unwrap();
+        let allowed = vec![normalize_path(allowed_file).unwrap()];
+
+        let allowed_out = run_read_file(allowed_file, None, None, true, Some(&allowed), false);
+        let other_out = run_read_file(other_file, None, None, true, Some(&allowed), false);
+        fs::remove_file(allowed_file).ok();
+        fs::remove_file(other_file).ok();
+
+        assert!(allowed_out.unwrap().contains("allowed"));
+        assert!(
+            other_out
+                .unwrap_err()
+                .to_string()
+                .contains("not in allowed list")
+        );
     }
 
     #[test]

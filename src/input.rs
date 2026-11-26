@@ -4,10 +4,15 @@ use glob::glob;
 use mime::Mime;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read};
 use std::path::Path;
 
 use crate::tools::normalize_path;
+
+/// Maximum lines of an `@!` file included in the prompt; the model reads the rest with read_file.
+const MAX_INLINE_EDIT_LINES: usize = 2_000;
+/// Maximum bytes of an `@!` file included in the prompt.
+const MAX_INLINE_EDIT_BYTES: usize = 100 * 1024;
 
 /// Type of file reference syntax marker
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,6 +258,12 @@ fn resolve_file_pattern_impl(pattern: &str, allow_missing: bool) -> Result<Vec<S
 pub enum FileReferenceKind {
     /// UTF-8 text content to include in the regular text context.
     Text(String),
+    /// The first lines of an `@!` text file too large to include in full.
+    PartialText {
+        content: String,
+        shown_lines: usize,
+        total_lines: usize,
+    },
     /// PDF or image content encoded as an OpenRouter data URL.
     Attachment { mime_type: String, data_url: String },
 }
@@ -342,14 +353,14 @@ fn read_input_file(
         });
     }
 
-    let content = if is_input_output {
-        read_file_if_exists(filename, remaining, limit)?
+    let kind = if is_input_output {
+        read_input_output_head(filename)?
     } else {
-        read_utf8_limited(filename, remaining, limit)?
+        FileReferenceKind::Text(read_utf8_limited(filename, remaining, limit)?)
     };
     Ok(FileReference {
         filename: filename.to_string(),
-        kind: FileReferenceKind::Text(content),
+        kind,
     })
 }
 
@@ -532,7 +543,8 @@ fn parse_file_patterns_with_budget(
                     max_input_bytes,
                 )?;
                 let content_bytes = match &file_reference.kind {
-                    FileReferenceKind::Text(content) => content.len(),
+                    FileReferenceKind::Text(content)
+                    | FileReferenceKind::PartialText { content, .. } => content.len(),
                     FileReferenceKind::Attachment { data_url, .. } => data_url.len(),
                 };
                 used = used
@@ -577,17 +589,49 @@ fn extract_filename(chars: &[char]) -> Result<(String, usize)> {
     Ok((filename, consumed))
 }
 
-/// Read file if it exists, otherwise return empty string
+/// Read an `@!` file, keeping only its first lines when it exceeds the inline limits.
 ///
-/// Used for @!file syntax where file might not exist yet
-fn read_file_if_exists(filename: &str, remaining: usize, limit: usize) -> Result<String> {
+/// A missing file yields empty content, since `@!` may name a file that does not exist yet.
+fn read_input_output_head(filename: &str) -> Result<FileReferenceKind> {
     let path = Path::new(filename);
-    if path.exists() {
-        read_utf8_limited(filename, remaining, limit)
-    } else {
-        // File doesn't exist yet - return empty content
-        Ok(String::new())
+    if !path.exists() {
+        return Ok(FileReferenceKind::Text(String::new()));
     }
+
+    let file = fs::File::open(path).with_context(|| {
+        format!(
+            "Could not read file '{}'. Make sure the file exists and is readable.",
+            filename
+        )
+    })?;
+    let mut reader = BufReader::new(file);
+    let mut head = Vec::new();
+    let mut line = Vec::new();
+    let mut shown_lines = 0;
+    let mut total_lines = 0;
+    while reader.read_until(b'\n', &mut line)? > 0 {
+        total_lines += 1;
+        // Stop at the first line that does not fit, so the head stays contiguous.
+        if shown_lines + 1 == total_lines
+            && shown_lines < MAX_INLINE_EDIT_LINES
+            && head.len() + line.len() <= MAX_INLINE_EDIT_BYTES
+        {
+            head.extend_from_slice(&line);
+            shown_lines += 1;
+        }
+        line.clear();
+    }
+
+    let content =
+        String::from_utf8(head).with_context(|| format!("{} is not valid UTF-8", filename))?;
+    if shown_lines == total_lines {
+        return Ok(FileReferenceKind::Text(content));
+    }
+    Ok(FileReferenceKind::PartialText {
+        content,
+        shown_lines,
+        total_lines,
+    })
 }
 
 /// Parse input from command-line arguments and STDIN
@@ -835,6 +879,66 @@ mod tests {
         let result = parse_file_patterns_limited(&prompt, prompt.len() + 3);
         fs::remove_file(filename).unwrap();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_large_input_output_file_is_included_partially() {
+        let filename = "test_inline_edit_lines.txt";
+        let total = MAX_INLINE_EDIT_LINES + 5;
+        let content: String = (1..=total).map(|n| format!("line {n}\n")).collect();
+        fs::write(filename, &content).unwrap();
+        let result = parse_file_patterns(&format!("update @!{filename}"));
+        fs::remove_file(filename).unwrap();
+
+        let (_, refs, _) = result.unwrap();
+        let FileReferenceKind::PartialText {
+            content,
+            shown_lines,
+            total_lines,
+        } = &refs[0].kind
+        else {
+            panic!("expected partial text, got {:?}", refs[0].kind);
+        };
+        assert_eq!(*shown_lines, MAX_INLINE_EDIT_LINES);
+        assert_eq!(*total_lines, total);
+        assert!(content.ends_with(&format!("\nline {MAX_INLINE_EDIT_LINES}\n")));
+    }
+
+    #[test]
+    fn test_input_output_file_head_respects_byte_limit() {
+        let filename = "test_inline_edit_bytes.txt";
+        let line = format!("{}\n", "x".repeat(999));
+        fs::write(filename, line.repeat(200)).unwrap();
+        // Larger than the inline limit, and larger than the whole input budget.
+        let result = parse_file_patterns_limited(&format!("update @!{filename}"), 150 * 1024);
+        fs::remove_file(filename).unwrap();
+
+        let (_, refs, _) = result.unwrap();
+        let FileReferenceKind::PartialText {
+            content,
+            shown_lines,
+            total_lines,
+        } = &refs[0].kind
+        else {
+            panic!("expected partial text, got {:?}", refs[0].kind);
+        };
+        assert_eq!(*shown_lines, MAX_INLINE_EDIT_BYTES / 1000);
+        assert_eq!(*total_lines, 200);
+        assert_eq!(content.len(), shown_lines * 1000);
+    }
+
+    #[test]
+    fn test_large_input_file_is_included_in_full() {
+        let filename = "test_inline_input_lines.txt";
+        let content: String = (1..=MAX_INLINE_EDIT_LINES + 5)
+            .map(|n| format!("line {n}\n"))
+            .collect();
+        fs::write(filename, &content).unwrap();
+        let result = parse_file_patterns(&format!("explain @{filename}"));
+        fs::remove_file(filename).unwrap();
+
+        let (_, refs, _) = result.unwrap();
+        assert_eq!(refs[0].kind, FileReferenceKind::Text(content));
     }
 
     #[test]
