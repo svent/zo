@@ -194,7 +194,7 @@ fn determine_tool_availability(
         FileToolMode::Disabled => ToolAvailability {
             read_tools: false,
             write_file: !output_files.is_empty(),
-            edit_tools: false,
+            edit_tools: output_files.iter().any(|f| f.include_as_input),
             shell_tools: tool_access.shell_enabled,
         },
         FileToolMode::ReadOnly => ToolAvailability {
@@ -1382,6 +1382,25 @@ mod tests {
         assert!(!availability.read_tools);
         assert!(availability.write_file);
         assert!(!availability.edit_tools);
+    }
+
+    #[test]
+    fn test_tool_availability_disabled_with_read_write_output() {
+        let output = OutputFileSpec {
+            filename: "rw.txt".to_string(),
+            normalized_path: "/tmp/rw.txt".to_string(),
+            include_as_input: true,
+        };
+        let availability = determine_tool_availability(
+            ToolAccess {
+                file_mode: FileToolMode::Disabled,
+                shell_enabled: false,
+            },
+            &[output],
+        );
+        assert!(!availability.read_tools);
+        assert!(availability.write_file);
+        assert!(availability.edit_tools);
     }
 
     #[test]

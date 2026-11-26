@@ -29,22 +29,33 @@ pub fn build_system_prompt(
             if output_files.is_empty() {
                 None
             } else {
-                Some(format!(
-                    "IMPORTANT: You can write files only via the `write_file` tool. \
-                     Allowed output files: {}. \
-                     Use `write_file` with the real filename (without !/@! markers). \
-                     Never write to any other path.{}",
-                    output_files
-                        .iter()
-                        .map(|f| f.filename.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    if allow_hidden {
-                        ""
-                    } else {
-                        " Hidden paths (dotfiles/dot-directories) are blocked unless the user enables --hidden."
-                    }
-                ))
+                let mut parts = vec![
+                    "IMPORTANT: You can modify files only via write tools, and only the files listed below."
+                        .to_string(),
+                ];
+                if !write_only_files.is_empty() {
+                    parts.push(format!(
+                        "Write-only files (`!file`): {}. Allowed write tool: write_file only.",
+                        write_only_files.join(", ")
+                    ));
+                }
+                if !read_write_files.is_empty() {
+                    parts.push(format!(
+                        "Read-write files (`@!file`): {}. Allowed write tools: write_file, edit_file, replace_lines.",
+                        read_write_files.join(", ")
+                    ));
+                }
+                parts.push(
+                    "Use write tools with the real filename (without !/@! markers). Never write to any other path."
+                        .to_string(),
+                );
+                if !allow_hidden {
+                    parts.push(
+                        "Hidden paths (dotfiles/dot-directories) are blocked unless the user enables --hidden."
+                            .to_string(),
+                    );
+                }
+                Some(parts.join("\n"))
             }
         }
         FileToolMode::ReadOnly => {
@@ -190,6 +201,25 @@ mod tests {
         );
         assert!(prompt.contains("write_file"));
         assert!(prompt.contains("a.txt"));
+        assert!(!prompt.contains("edit_file"));
+    }
+
+    #[test]
+    fn test_disabled_mode_with_read_write_output_mentions_edit_tools() {
+        let prompt = build_system_prompt(
+            &model(),
+            &[output("wo.txt", false), output("rw.txt", true)],
+            ToolAccess {
+                file_mode: FileToolMode::Disabled,
+                shell_enabled: false,
+            },
+            false,
+        );
+        assert!(prompt.contains("Write-only files"));
+        assert!(prompt.contains("wo.txt"));
+        assert!(prompt.contains("rw.txt"));
+        assert!(prompt.contains("edit_file"));
+        assert!(prompt.contains("replace_lines"));
     }
 
     #[test]
