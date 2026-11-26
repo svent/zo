@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.9.0]
+
+### Added
+- Targeted editing with `edit_file` and `replace_lines` for read-write `@!file` outputs even when general file tools are disabled
+- Constrained `read_file` access to explicitly permitted `@!file` outputs when general file tools are disabled, including support for reading specific line ranges
+- Optional `line_numbers` parameter for `read_file` to omit line-number prefixes; line numbers remain enabled by default
+
+### Changed
+- Inline content for `@!file` references is now limited to complete leading lines within 2,000 lines and 100 KiB; larger files report shown and total line counts and can be read further with `read_file`
+
+### Improved
+- System prompts now distinguish write-only and read-write file permissions and advise rereading edited files before using `replace_lines` because line numbers may shift
+- Expanded regression coverage for partial file inclusion, inline byte and line limits, constrained rereads, optional line numbers, and tool availability and prompt guidance
+
 ## [0.8.0]
 
 ### Added
